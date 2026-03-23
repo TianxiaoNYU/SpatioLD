@@ -18,17 +18,25 @@ From the `SpatioLD/` folder:
 pip install -e .
 ```
 
-Optional extras:
+### Recreate Conda Environment Snapshot
+
+A full export from the `spatiometrics` conda environment is saved at:
+
+- `requirements-spatiold.txt`
+
+This snapshot was exported on `osx-arm64`.
+
+Recreate a matching environment:
 
 ```bash
-# venn diagrams
-pip install -e .[plot]
+conda create --name spatiold --file requirements-spatiold.txt
+conda activate spatiold
+```
 
-# scanpy-based HVG function
-pip install -e .[omics]
+Install this package in editable mode inside that environment:
 
-# tests
-pip install -e .[dev]
+```bash
+pip install -e .
 ```
 
 ## Quick Start
