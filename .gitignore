@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
