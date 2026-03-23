@@ -5,7 +5,7 @@
 This package now reflects the newer `src/slidetag.ipynb` pipeline and includes:
 
 - Fundamental local-diversity computation and permutation inference
-- AnnData-compatible object API
+- A unified `SpatioLD` object workflow for downstream analysis
 - Updated gene-radius modeling pipeline (spline/poly basis + per-gene fitting)
 - Pipeline-level utilities for clustering, summaries, SVG scoring
 - Visualization helpers for key outputs
@@ -55,19 +55,15 @@ pval_df = sld.compute_nd_permutation_pvals(coords, labels, n_perm=200, radii=[2.
 perm_dist = sld.compute_nd_permutation_distribution(coords, labels, n_perm=200, radii=[2.0])
 ```
 
-### 2) AnnData object API
+### 2) SpatioLD Object Workflow
 
 ```python
-import numpy as np
-import anndata as ad
 from spatiold import SpatioLD
 
-adata = ad.AnnData(X=np.empty((4, 0)))
-adata.obs_names = ["c1", "c2", "c3", "c4"]
-adata.obs["cell_type"] = ["A", "A", "B", "B"]
-adata.obsm["spatial"] = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
+coords = [[0, 0], [0, 1], [1, 0], [1, 1]]
+labels = ["A", "A", "B", "B"]
 
-obj = SpatioLD.from_anndata(adata, label_key="cell_type")
+obj = SpatioLD.from_arrays(coords=coords, labels=labels, cell_ids=["c1", "c2", "c3", "c4"])
 ld_df = obj.compute_local_diversity(radii=[0.1, 2.0], store=True)
 ```
 
@@ -76,7 +72,7 @@ ld_df = obj.compute_local_diversity(radii=[0.1, 2.0], store=True)
 ```python
 import spatiold as sld
 
-# assume obj = SpatioLD.from_anndata(...)
+# assume obj = SpatioLD.from_arrays(...) or SpatioLD.from_anndata(...)
 ld_df = obj.compute_local_diversity(radii=[30, 60, 90], key="ld_full")
 pvals_df = obj.compute_permutation_pvals(n_perm=100, radii=[30, 60, 90], key="ld_pvals")
 perm_dist = obj.compute_permutation_distribution(n_perm=100, radii=[30, 60, 90])
@@ -105,7 +101,7 @@ svg_df = obj.compute_svg_morans_i(expr_df, k=15)
 
 - `src/spatiold/diversity.py`: local-diversity computation
 - `src/spatiold/permutation.py`: p-values, null mean, full permutation distribution
-- `src/spatiold/core.py`: `SpatioLD` object (AnnData-first)
+- `src/spatiold/core.py`: `SpatioLD` object API
 - `src/spatiold/modeling.py`: regression helpers from prior workflow
 - `src/spatiold/pipeline.py`: updated SlideTag-style fundamental pipeline functions
 - `src/spatiold/plotting.py`: visualization utilities for pipeline outputs
@@ -113,7 +109,7 @@ svg_df = obj.compute_svg_morans_i(expr_df, k=15)
 ## Demos
 
 - `demo/synthetic_quickstart.py`
-- `demo/anndata_quickstart.py`
+- `demo/anndata_quickstart.py` (compatibility example)
 - `demo/slidetag_style_pipeline.py` (uses `example_data/SlideTag_HumanCortex.csv` metadata and synthetic expression, default 1000 genes)
 
 Run the SlideTag-style demo:
@@ -137,3 +133,4 @@ pytest
 - `compute_nd_permutation_pvals` and `compute_nd_permutation_mean` are preserved.
 - `compute_neighborhood_diversity` remains available as an alias.
 - New `compute_nd_permutation_distribution` supports downstream CI/null-curve plotting in the updated pipeline.
+- `SpatioLD` is compatible with AnnData through `SpatioLD.from_anndata(...)`.
