@@ -108,10 +108,10 @@ def plot_sample_vs_null_curve(
     ax.errorbar(
         x,
         s[sample_mean_col],
-        yerr=s[sample_std_col],
+        # yerr=s[sample_std_col],
         fmt="o-",
         color="#1f77b4",
-        ecolor="#9ecae1",
+        # ecolor="#9ecae1",
         capsize=4,
         linewidth=2,
         label="Sample",
@@ -127,7 +127,7 @@ def plot_sample_vs_null_curve(
     ax.errorbar(
         x,
         y_null,
-        # yerr=yerr_null,
+        yerr=yerr_null,
         fmt="o-",
         color="gray",
         ecolor="lightgray",
@@ -217,7 +217,7 @@ def plot_significant_diversity_maps(
 
     n_panels = len(radii)
     nrows = int(math.ceil(n_panels / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4.6 * nrows), dpi=250)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.8 * ncols, 4.6 * nrows), dpi=250)
     axes = np.atleast_1d(axes).ravel()
 
     last_sc = None
@@ -243,7 +243,7 @@ def plot_significant_diversity_maps(
         axes[j].axis("off")
 
     if last_sc is not None:
-        cbar = fig.colorbar(last_sc, ax=axes.tolist(), fraction=0.02, pad=0.01, ticks=[0, 1])
+        cbar = fig.colorbar(last_sc, ax=axes.tolist(), fraction=0.046, pad=0.04, ticks=[0, 1])
         cbar.ax.set_yticklabels(["No (p>=alpha)", "Yes (p<alpha)"])
         cbar.set_label("Locally significantly diverse")
 
