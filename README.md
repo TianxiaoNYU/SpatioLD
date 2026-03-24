@@ -2,7 +2,7 @@
 
 `SpatioLD` is a standalone Python package for spatial local diversity analysis in spatial transcriptomics and related spatial omics data.
 
-This package now reflects the newer `src/slidetag.ipynb` pipeline and includes:
+This package includes:
 
 - Fundamental local-diversity computation and permutation inference
 - A unified `SpatioLD` object workflow for downstream analysis
@@ -96,6 +96,41 @@ results_df, fit_objects = sld.fit_all_genes(expr_df, shared)
 ax = sld.plot_gene_effect_volcano(results_df)
 svg_df = obj.compute_svg_morans_i(expr_df, k=15)
 ```
+
+## Terminal Pipeline Runner
+
+After installation, you can run the full pipeline directly from terminal:
+
+```bash
+spatiold-pipeline \
+  --metadata /path/to/metadata.csv \
+  --expression /path/to/expression.csv \
+  --output-dir /path/to/output \
+  --radii 30 60 90 120 150 180 210 240 270
+```
+
+Equivalent module form:
+
+```bash
+python -m spatiold.cli \
+  --metadata /path/to/metadata.csv \
+  --expression /path/to/expression.csv \
+  --output-dir /path/to/output \
+  --radii 30 60 90 120 150 180 210 240 270
+```
+
+Required inputs:
+
+- `--metadata`: metadata table
+- `--expression`: expression table
+- `--output-dir`: directory for outputs
+- `--radii`: radius grid
+
+Common optional inputs (dataset-dependent):
+
+- `--cell-id-col` if cell IDs are not in index/`unique_id`
+- `--x-col`, `--y-col`, `--cell-type-col` if metadata columns use different names
+- `--n-perm`, `--n-model-genes` for runtime control
 
 ## Main Modules
 
