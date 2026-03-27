@@ -121,6 +121,18 @@ spatiold-pipeline \
   --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10
 ```
 
+For faster iteration without permutation inference, use slim mode:
+
+```bash
+spatiold-pipeline-slim \
+  --metadata /path/to/metadata.csv \
+  --expression /path/to/expression.csv \
+  --output-dir /path/to/output \
+  --radii 30 60 90 120 150 180 210 240 270 --min-genes-per-cell 10
+```
+
+`spatiold-pipeline-slim` skips permutation p-value/null computation, while keeping preprocessing, local diversity, clustering, slide-level modeling, gene-radius modeling, and SVG scoring. Permutation-dependent output files are still written with placeholder values.
+
 Equivalent module form:
 
 ```bash

@@ -96,19 +96,23 @@ def _orient_expression(expr_raw: pd.DataFrame, meta_index: pd.Index) -> pd.DataF
     return expr
 
 
-def _write_args_snapshot(args: argparse.Namespace, output_dir: Path, radii: list[float]) -> None:
+def _write_args_snapshot(
+    args: argparse.Namespace,
+    output_dir: Path,
+    radii: list[float],
+    *,
+    permutation_enabled: bool,
+) -> None:
     payload = vars(args).copy()
     payload["radii"] = radii
     payload["metadata"] = str(args.metadata)
     payload["expression"] = str(args.expression)
     payload["output_dir"] = str(args.output_dir)
+    payload["permutation_enabled"] = permutation_enabled
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2))
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run SpatioLD pipeline on one sample from metadata + expression tables."
-    )
+def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metadata", type=Path, required=True, help="Metadata path (.csv/.tsv/.txt/.parquet).")
     parser.add_argument("--expression", type=Path, required=True, help="Expression matrix path (.csv/.tsv/.txt/.parquet).")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write pipeline outputs.")
@@ -124,10 +128,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
     parser.add_argument("--y-col", type=str, default="y", help="Metadata y-coordinate column.")
     parser.add_argument("--cell-type-col", type=str, default="cell_type", help="Metadata cell-type label column.")
-
-    parser.add_argument("--n-perm", type=int, default=100, help="Permutation count for p-values and null summaries.")
-    parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
-    parser.add_argument("--alpha", type=float, default=0.05, help="Significance alpha for p-value mask.")
 
     parser.add_argument("--min-fraction-expressed", type=float, default=0.02, help="Gene filter: minimum fraction of cells with nonzero expression.")
     parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
@@ -152,13 +152,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable default global-entropy normalization of local-diversity response in gene modeling.",
     )
     parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
-
-    parser.add_argument("--save-permutation-distribution", action="store_true", help="Also save full permutation distribution to `.npz`.")
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run full SpatioLD pipeline (including permutation inference)."
+    )
+    _add_common_pipeline_arguments(parser)
+    parser.add_argument("--n-perm", type=int, default=100, help="Permutation count for p-values and null summaries.")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
+    parser.add_argument("--alpha", type=float, default=0.05, help="Significance alpha for p-value mask.")
+    parser.add_argument("--save-permutation-distribution", action="store_true", help="Also save full permutation distribution to `.npz`.")
     return parser
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def build_slim_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run SpatioLD pipeline in slim mode (skip permutation inference; keep all non-permutation steps)."
+        )
+    )
+    _add_common_pipeline_arguments(parser)
+    return parser
+
+
+def _build_sample_only_null_summary(local_diversity_df: pd.DataFrame) -> pd.DataFrame:
+    obs = local_diversity_df.to_numpy(dtype=float)
+    return pd.DataFrame(
+        {
+            "radius": [float(c) for c in local_diversity_df.columns],
+            "sample_mean": obs.mean(axis=0),
+            "sample_std": obs.std(axis=0),
+            "null_mean": np.nan,
+            "null_ci_low": np.nan,
+            "null_ci_high": np.nan,
+        }
+    )
+
+
+def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) -> None:
     if not args.metadata.exists():
         raise FileNotFoundError(f"Metadata file not found: {args.metadata}")
     if not args.expression.exists():
@@ -216,23 +249,30 @@ def run_pipeline(args: argparse.Namespace) -> None:
     perm_mean_key = "spatiold_local_diversity_perm_mean"
 
     ld_df = obj.compute_local_diversity(radii=radii, key=ld_key)
-    perm_stats = obj.compute_permutation_stats(
-        n_perm=args.n_perm,
-        radii=radii,
-        random_state=args.random_state,
-        n_jobs=-1,
-        store=True,
-        pvals_key=pval_key,
-        perm_mean_key=perm_mean_key,
-    )
-    pvals_df = perm_stats["pvals"]
-    perm_mean_df = perm_stats["perm_mean"]
-    perm_dist = perm_stats["distribution"]
-
     summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
-    summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
     cluster_labels_df, _ = obj.cluster_local_diversity_profiles(local_diversity_key=ld_key, k_values=args.k_values)
-    sig_mask_df = obj.build_significance_mask(pvals_key=pval_key, alpha=args.alpha)
+
+    if skip_permutation:
+        pvals_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        perm_mean_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        summary_null = _build_sample_only_null_summary(ld_df)
+        sig_mask_df = pd.DataFrame(0, index=ld_df.index, columns=ld_df.columns, dtype=int)
+        perm_dist = None
+    else:
+        perm_stats = obj.compute_permutation_stats(
+            n_perm=args.n_perm,
+            radii=radii,
+            random_state=args.random_state,
+            n_jobs=-1,
+            store=True,
+            pvals_key=pval_key,
+            perm_mean_key=perm_mean_key,
+        )
+        pvals_df = perm_stats["pvals"]
+        perm_mean_df = perm_stats["perm_mean"]
+        perm_dist = perm_stats["distribution"]
+        summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
+        sig_mask_df = obj.build_significance_mask(pvals_key=pval_key, alpha=args.alpha)
 
     shared = obj.prepare_shared_components(
         local_diversity_key=ld_key,
@@ -275,10 +315,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
     results_df.to_csv(output_dir / "gene_radius_model_results.csv", index=False)
     svg_df.to_csv(output_dir / "svg_morans_i.csv", index=False)
 
-    if args.save_permutation_distribution:
+    if (not skip_permutation) and getattr(args, "save_permutation_distribution", False):
         np.savez_compressed(output_dir / "permutation_distribution.npz", permutation_distribution=perm_dist)
 
-    _write_args_snapshot(args, output_dir, radii)
+    _write_args_snapshot(args, output_dir, radii, permutation_enabled=not skip_permutation)
 
     summary_payload = {
         "n_cells": int(expr_aligned.shape[0]),
@@ -289,11 +329,15 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "response_normalization_factor": shared["response_normalization_factor"],
         "n_radii": int(len(radii)),
         "radii": radii,
+        "permutation_enabled": not skip_permutation,
+        "n_perm": int(args.n_perm) if not skip_permutation else 0,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
 
     if not args.quiet:
+        mode = "full" if not skip_permutation else "slim (permutation skipped)"
         print("SpatioLD pipeline complete.")
+        print(f"Mode: {mode}")
         print(f"Metadata: {args.metadata}")
         print(f"Expression: {args.expression}")
         print(f"Output dir: {output_dir}")
@@ -307,6 +351,12 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     run_pipeline(args)
+
+
+def main_slim() -> None:
+    parser = build_slim_parser()
+    args = parser.parse_args()
+    run_pipeline(args, skip_permutation=True)
 
 
 if __name__ == "__main__":
