@@ -24,6 +24,9 @@ Main methods:
 - `cluster_local_diversity_profiles(...)`
 - `build_significance_mask(...)`
 - `prepare_shared_components(...)` (regression response is entropy-normalized by default)
+- `fit_slide_level_cell_type_radius_model(...)`
+- `summarize_slide_level_cell_type_effects(...)`
+- `summarize_model_terms(...)`
 - `compute_svg_morans_i(...)`
 - `get_coords_df(...)`
 - `get_result(key)`
@@ -58,6 +61,9 @@ Gene-radius model utilities:
 - `fit_single_gene_radius_model(gene_values, shared, ...)`
 - `reconstruct_radius_effect(fit_result, shared, ...)`
 - `fit_all_genes(expr_df, shared, ...)`
+- `fit_slide_level_cell_type_radius_model(shared, ...)`
+- `summarize_slide_level_cell_type_effects(fit_result, shared, ...)`
+- `summarize_model_terms(fit_result)`
 
 Spatial/HVG helpers:
 

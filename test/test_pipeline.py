@@ -11,8 +11,11 @@ from spatiold import (
     compute_nd_permutation_distribution,
     compute_sample_vs_null_summary,
     compute_svg_morans_i,
+    fit_slide_level_cell_type_radius_model,
     fit_single_gene_radius_model,
     prepare_shared_components,
+    summarize_model_terms,
+    summarize_slide_level_cell_type_effects,
     summarize_local_diversity_by_cell_type,
 )
 
@@ -132,3 +135,29 @@ def test_prepare_shared_components_entropy_normalization_controls() -> None:
     )
     assert shared_raw["response_normalization_factor"] is None
     assert np.allclose(shared_raw["Y"], Y)
+
+
+def test_slide_level_cell_type_radius_model() -> None:
+    pytest.importorskip("statsmodels")
+
+    coords, labels, meta = _make_small_dataset()
+    ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30, 40])
+
+    shared = prepare_shared_components(
+        response_matrix=ld.values,
+        metadata_df=meta.loc[ld.index],
+        radius_values=[10, 20, 30, 40],
+        cell_type_col="cell_type",
+        radius_mode="spline",
+        n_radius_knots=4,
+        spline_degree=2,
+    )
+    fit = fit_slide_level_cell_type_radius_model(shared)
+    terms_df = summarize_model_terms(fit)
+    effects_df = summarize_slide_level_cell_type_effects(fit, shared)
+
+    assert {"term", "beta", "se", "pval", "t"}.issubset(terms_df.columns)
+    assert {"cell_type", "beta_cell_type", "se_cell_type", "pval_cell_type", "t_cell_type"}.issubset(
+        effects_df.columns
+    )
+    assert shared["reference_cell_type"] in effects_df["cell_type"].values

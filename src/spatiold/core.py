@@ -27,7 +27,10 @@ from .pipeline import (
     compute_global_shannon_entropy as _compute_global_shannon_entropy,
     compute_sample_vs_null_summary as _compute_sample_vs_null_summary,
     compute_svg_morans_i as _compute_svg_morans_i,
+    fit_slide_level_cell_type_radius_model as _fit_slide_level_cell_type_radius_model,
     prepare_shared_components as _prepare_shared_components,
+    summarize_model_terms as _summarize_model_terms,
+    summarize_slide_level_cell_type_effects as _summarize_slide_level_cell_type_effects,
     summarize_local_diversity_by_cell_type as _summarize_local_diversity_by_cell_type,
 )
 
@@ -427,6 +430,67 @@ class SpatioLD:
             normalize_by=normalize_by,
             normalize_by_global_entropy=normalize_by_global_entropy,
         )
+
+    def fit_slide_level_cell_type_radius_model(
+        self,
+        *,
+        shared: dict[str, Any] | None = None,
+        response_matrix: pd.DataFrame | np.ndarray | None = None,
+        local_diversity_key: str = "spatiold_local_diversity",
+        radius_values: list[float] | tuple[float, ...] | None = None,
+        cell_type_col: str | None = None,
+        cell_id_col: str | None = None,
+        reference_cell_type: str | None = None,
+        radius_mode: str = "spline",
+        n_radius_knots: int = 5,
+        spline_degree: int = 3,
+        poly_degree: int = 3,
+        normalize_by: float | None = None,
+        normalize_by_global_entropy: bool = True,
+        add_intercept: bool = True,
+        cluster_robust: bool = True,
+    ) -> dict[str, Any]:
+        """Fit one slide-level model using cell-type and radius effects only."""
+        shared_use = shared
+        if shared_use is None:
+            shared_use = self.prepare_shared_components(
+                response_matrix=response_matrix,
+                local_diversity_key=local_diversity_key,
+                radius_values=radius_values,
+                cell_type_col=cell_type_col,
+                cell_id_col=cell_id_col,
+                reference_cell_type=reference_cell_type,
+                radius_mode=radius_mode,
+                n_radius_knots=n_radius_knots,
+                spline_degree=spline_degree,
+                poly_degree=poly_degree,
+                normalize_by=normalize_by,
+                normalize_by_global_entropy=normalize_by_global_entropy,
+            )
+
+        return _fit_slide_level_cell_type_radius_model(
+            shared_use,
+            add_intercept=add_intercept,
+            cluster_robust=cluster_robust,
+        )
+
+    def summarize_slide_level_cell_type_effects(
+        self,
+        fit_result: dict[str, Any],
+        shared: dict[str, Any],
+        *,
+        include_reference: bool = True,
+    ) -> pd.DataFrame:
+        """Summarize per-cell-type effects from slide-level model fit."""
+        return _summarize_slide_level_cell_type_effects(
+            fit_result,
+            shared,
+            include_reference=include_reference,
+        )
+
+    def summarize_model_terms(self, fit_result: dict[str, Any]) -> pd.DataFrame:
+        """Summarize model terms as coefficient/SE/p-value table."""
+        return _summarize_model_terms(fit_result)
 
     def compute_svg_morans_i(
         self,

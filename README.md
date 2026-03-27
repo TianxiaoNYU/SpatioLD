@@ -100,6 +100,10 @@ shared = obj.prepare_shared_components(
 )
 results_df, fit_objects = sld.fit_all_genes(expr_df, shared)
 
+# slide-level cell-type model (fit once per slide)
+ct_fit = sld.fit_slide_level_cell_type_radius_model(shared)
+ct_effects = sld.summarize_slide_level_cell_type_effects(ct_fit, shared)
+
 # plotting
 ax = sld.plot_gene_effect_volcano(results_df)
 svg_df = obj.compute_svg_morans_i(expr_df, k=15)
@@ -141,6 +145,11 @@ Common optional inputs (dataset-dependent):
 - `--n-perm`, `--n-model-genes` for runtime control
 - `--regression-normalize-by` or `--no-regression-entropy-normalize` to control
   response normalization in gene-radius regression
+
+CLI now also writes slide-level cell-type model outputs:
+
+- `slide_cell_type_radius_model_terms.csv`
+- `slide_cell_type_effects.csv`
 
 ## Main Modules
 

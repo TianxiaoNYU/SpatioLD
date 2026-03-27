@@ -11,7 +11,14 @@ import numpy as np
 import pandas as pd
 
 from .core import SpatioLD
-from .pipeline import align_expression_and_metadata, fit_all_genes, preprocess_expression_matrix
+from .pipeline import (
+    align_expression_and_metadata,
+    fit_all_genes,
+    fit_slide_level_cell_type_radius_model,
+    preprocess_expression_matrix,
+    summarize_model_terms,
+    summarize_slide_level_cell_type_effects,
+)
 
 DEFAULT_RADII = [30, 60, 90, 120, 150, 180, 210, 240, 270]
 
@@ -227,11 +234,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     cluster_labels_df, _ = obj.cluster_local_diversity_profiles(local_diversity_key=ld_key, k_values=args.k_values)
     sig_mask_df = obj.build_significance_mask(pvals_key=pval_key, alpha=args.alpha)
 
-    n_model_genes = max(1, min(int(args.n_model_genes), expr_aligned.shape[1]))
-    var_rank = expr_aligned.var(axis=0).sort_values(ascending=False)
-    model_genes = var_rank.head(n_model_genes).index
-    expr_model = expr_aligned.loc[:, model_genes].copy()
-
     shared = obj.prepare_shared_components(
         local_diversity_key=ld_key,
         radius_mode=args.radius_mode,
@@ -241,6 +243,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
         normalize_by=args.regression_normalize_by,
         normalize_by_global_entropy=not args.no_regression_entropy_normalize,
     )
+    slide_ct_fit = fit_slide_level_cell_type_radius_model(
+        shared,
+        cluster_robust=not args.no_cluster_robust,
+    )
+    slide_ct_terms_df = summarize_model_terms(slide_ct_fit)
+    slide_ct_effects_df = summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
+
+    n_model_genes = max(1, min(int(args.n_model_genes), expr_aligned.shape[1]))
+    var_rank = expr_aligned.var(axis=0).sort_values(ascending=False)
+    model_genes = var_rank.head(n_model_genes).index
+    expr_model = expr_aligned.loc[:, model_genes].copy()
+
     results_df, _ = fit_all_genes(
         expr_model,
         shared,
@@ -256,6 +270,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     summary_null.to_csv(output_dir / "summary_sample_vs_null.csv", index=False)
     cluster_labels_df.to_csv(output_dir / "cluster_labels.csv")
     sig_mask_df.to_csv(output_dir / "significance_mask.csv")
+    slide_ct_terms_df.to_csv(output_dir / "slide_cell_type_radius_model_terms.csv", index=False)
+    slide_ct_effects_df.to_csv(output_dir / "slide_cell_type_effects.csv", index=False)
     results_df.to_csv(output_dir / "gene_radius_model_results.csv", index=False)
     svg_df.to_csv(output_dir / "svg_morans_i.csv", index=False)
 
@@ -268,6 +284,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "n_cells": int(expr_aligned.shape[0]),
         "n_genes_after_filter": int(expr_aligned.shape[1]),
         "n_model_genes": int(expr_model.shape[1]),
+        "n_cell_types": int(len(shared["cell_type_levels"])),
+        "reference_cell_type": str(shared["reference_cell_type"]),
+        "response_normalization_factor": shared["response_normalization_factor"],
         "n_radii": int(len(radii)),
         "radii": radii,
     }

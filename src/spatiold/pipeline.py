@@ -324,6 +324,8 @@ def prepare_shared_components(
         "n_cells": n_cells,
         "n_radii": n_radii,
         "radius_values": radius_values,
+        "cell_type_col": cell_type_col,
+        "cell_type_levels": ordered_ct,
         "groups_long": groups_long,
         "ct_long": ct_long,
         "ct_feature_names": ct_feature_names,
@@ -382,6 +384,123 @@ def fit_single_gene_radius_model(
         "pval": pval,
         "feature_names": feature_names,
     }
+
+
+def fit_slide_level_cell_type_radius_model(
+    shared: dict[str, Any],
+    *,
+    add_intercept: bool = True,
+    cluster_robust: bool = True,
+) -> dict[str, Any]:
+    """Fit one slide-level model using only cell type and radius terms.
+
+    Model:
+        ``E_{i,r} = cell_type_i + f(r) + error``
+    """
+    import statsmodels.api as sms
+
+    X = np.hstack([shared["ct_long"], shared["radius_long"]])
+    feature_names = shared["ct_feature_names"] + shared["radius_feature_names"]
+
+    if add_intercept:
+        X = sms.add_constant(X, has_constant="add")
+        feature_names = ["const"] + feature_names
+
+    model = sms.OLS(shared["y_long"], X)
+    if cluster_robust:
+        fit_res = model.fit(cov_type="cluster", cov_kwds={"groups": shared["groups_long"]})
+    else:
+        fit_res = model.fit()
+
+    coef = pd.Series(fit_res.params, index=feature_names)
+    se = pd.Series(fit_res.bse, index=feature_names)
+    pval = pd.Series(fit_res.pvalues, index=feature_names)
+
+    return {
+        "fit": fit_res,
+        "coef": coef,
+        "se": se,
+        "pval": pval,
+        "feature_names": feature_names,
+    }
+
+
+def summarize_model_terms(fit_result: dict[str, Any]) -> pd.DataFrame:
+    """Summarize model coefficients with SE/p-value statistics."""
+    coef = fit_result["coef"]
+    se = fit_result["se"]
+    pval = fit_result["pval"]
+
+    df = pd.DataFrame(
+        {
+            "term": coef.index.astype(str),
+            "beta": coef.values.astype(float),
+            "se": se.values.astype(float),
+            "pval": pval.values.astype(float),
+        }
+    )
+    df["t"] = np.where(df["se"] != 0, df["beta"] / df["se"], np.nan)
+    return df
+
+
+def summarize_slide_level_cell_type_effects(
+    fit_result: dict[str, Any],
+    shared: dict[str, Any],
+    *,
+    include_reference: bool = True,
+) -> pd.DataFrame:
+    """Extract slide-level cell-type effects from fitted cell-type/radius model."""
+    coef = fit_result["coef"]
+    se = fit_result["se"]
+    pval = fit_result["pval"]
+
+    ref = str(shared["reference_cell_type"])
+    levels = [str(c) for c in shared["cell_type_levels"]]
+    feature_names = [str(c) for c in shared["ct_feature_names"]]
+
+    rows: list[dict[str, Any]] = []
+    if include_reference:
+        rows.append(
+            {
+                "cell_type": ref,
+                "feature": "reference",
+                "is_reference": True,
+                "beta_cell_type": 0.0,
+                "se_cell_type": np.nan,
+                "pval_cell_type": np.nan,
+                "t_cell_type": np.nan,
+            }
+        )
+
+    for ct, feature in zip(levels[1:], feature_names, strict=False):
+        beta = float(coef[feature])
+        beta_se = float(se[feature])
+        rows.append(
+            {
+                "cell_type": ct,
+                "feature": feature,
+                "is_reference": False,
+                "beta_cell_type": beta,
+                "se_cell_type": beta_se,
+                "pval_cell_type": float(pval[feature]),
+                "t_cell_type": beta / beta_se if beta_se != 0 else np.nan,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(
+            columns=[
+                "cell_type",
+                "feature",
+                "is_reference",
+                "beta_cell_type",
+                "se_cell_type",
+                "pval_cell_type",
+                "t_cell_type",
+            ]
+        )
+    return out.reset_index(drop=True)
 
 
 def reconstruct_radius_effect(

@@ -55,6 +55,8 @@ def test_from_anndata_with_obs_coordinates() -> None:
 
 
 def test_object_wrappers_for_downstream_pipeline() -> None:
+    pytest.importorskip("statsmodels")
+
     rng = np.random.default_rng(7)
     n_cells = 24
     n_genes = 6
@@ -109,6 +111,9 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
     cluster_df, models = obj.cluster_local_diversity_profiles(local_diversity_key="ld_full", k_values=(2, 3))
     mask = obj.build_significance_mask(pvals_key="pvals_full", alpha=0.05)
     shared = obj.prepare_shared_components(local_diversity_key="ld_full", radius_mode="poly", poly_degree=2)
+    slide_ct_fit = obj.fit_slide_level_cell_type_radius_model(shared=shared)
+    slide_ct_terms = obj.summarize_model_terms(slide_ct_fit)
+    slide_ct_effects = obj.summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
     svg = obj.compute_svg_morans_i(expr, k=5)
 
     assert set(cluster_df.columns) == {"ld_kmeans_k2", "ld_kmeans_k3"}
@@ -120,5 +125,7 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
     if entropy > 0:
         assert np.allclose(shared["Y"], ld.values / entropy)
         assert np.isclose(shared["response_normalization_factor"], entropy)
+    assert {"term", "beta", "se", "pval", "t"}.issubset(slide_ct_terms.columns)
+    assert {"cell_type", "beta_cell_type"}.issubset(slide_ct_effects.columns)
     assert list(svg.columns) == ["gene", "moran_I"]
     assert svg.shape[0] == n_genes
