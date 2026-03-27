@@ -85,12 +85,20 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
 
     radii = [20.0, 40.0, 60.0]
     ld = obj.compute_local_diversity(radii=radii, key="ld_full")
-    pvals = obj.compute_permutation_pvals(n_perm=8, radii=radii, n_jobs=1, key="pvals_full")
-    dist = obj.compute_permutation_distribution(n_perm=6, radii=radii, n_jobs=1)
+    perm_stats = obj.compute_permutation_stats(
+        n_perm=8,
+        radii=radii,
+        n_jobs=1,
+        pvals_key="pvals_full",
+        perm_mean_key="perm_mean_full",
+    )
+    pvals = perm_stats["pvals"]
+    dist = perm_stats["distribution"]
 
     assert ld.shape == (n_cells, len(radii))
     assert pvals.shape == (n_cells, len(radii))
-    assert dist.shape == (6, len(radii), n_cells)
+    assert perm_stats["perm_mean"].shape == (n_cells, len(radii))
+    assert dist.shape == (8, len(radii), n_cells)
     assert obj.compute_global_shannon_entropy() >= 0
 
     summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key="ld_full")
@@ -108,5 +116,9 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
     assert mask.shape == pvals.shape
     assert shared["n_cells"] == n_cells
     assert shared["n_radii"] == len(radii)
+    entropy = obj.compute_global_shannon_entropy()
+    if entropy > 0:
+        assert np.allclose(shared["Y"], ld.values / entropy)
+        assert np.isclose(shared["response_normalization_factor"], entropy)
     assert list(svg.columns) == ["gene", "moran_I"]
     assert svg.shape[0] == n_genes

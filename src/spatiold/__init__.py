@@ -19,6 +19,7 @@ from .permutation import (
     compute_nd_permutation_distribution,
     compute_nd_permutation_mean,
     compute_nd_permutation_pvals,
+    compute_nd_permutation_stats,
 )
 from .pipeline import (
     align_expression_and_metadata,
@@ -55,6 +56,7 @@ __all__ = [
     "compute_nd_permutation_pvals",
     "compute_nd_permutation_mean",
     "compute_nd_permutation_distribution",
+    "compute_nd_permutation_stats",
     "compute_global_shannon_entropy",
     "preprocess_expression_matrix",
     "align_expression_and_metadata",

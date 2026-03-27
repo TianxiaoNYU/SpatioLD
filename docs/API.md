@@ -14,6 +14,7 @@ Constructors:
 Main methods:
 
 - `compute_local_diversity(...)`
+- `compute_permutation_stats(...)` (single-pass p-values + null mean + distribution)
 - `compute_permutation_pvals(...)`
 - `compute_permutation_mean(...)`
 - `compute_permutation_distribution(...)`
@@ -22,7 +23,7 @@ Main methods:
 - `compute_sample_vs_null_summary(...)`
 - `cluster_local_diversity_profiles(...)`
 - `build_significance_mask(...)`
-- `prepare_shared_components(...)`
+- `prepare_shared_components(...)` (regression response is entropy-normalized by default)
 - `compute_svg_morans_i(...)`
 - `get_coords_df(...)`
 - `get_result(key)`
@@ -35,6 +36,7 @@ Main methods:
 - `compute_nd_permutation_pvals(xy, labels, n_perm, ...)`
 - `compute_nd_permutation_mean(xy, labels, n_perm, ...)`
 - `compute_nd_permutation_distribution(xy, labels, n_perm, ...)`
+- `compute_nd_permutation_stats(xy, labels, n_perm, ...)` (single-pass combined output)
 - `DEFAULT_RADII`
 
 ## Updated SlideTag-Style Pipeline
@@ -52,7 +54,7 @@ Fundamental utilities:
 Gene-radius model utilities:
 
 - `make_spline_basis(radius_values, ...)`
-- `prepare_shared_components(response_matrix, metadata_df, radius_values, ...)`
+- `prepare_shared_components(response_matrix, metadata_df, radius_values, ..., normalize_by=None, normalize_by_global_entropy=True)`
 - `fit_single_gene_radius_model(gene_values, shared, ...)`
 - `reconstruct_radius_effect(fit_result, shared, ...)`
 - `fit_all_genes(expr_df, shared, ...)`

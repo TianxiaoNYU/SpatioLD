@@ -83,3 +83,52 @@ def test_gene_radius_model_and_svg() -> None:
     svg_df = compute_svg_morans_i(expr, coords)
     assert list(svg_df.columns) == ["gene", "moran_I"]
     assert svg_df.shape[0] == expr.shape[1]
+
+
+def test_prepare_shared_components_entropy_normalization_controls() -> None:
+    meta = pd.DataFrame(
+        {
+            "cell_type": ["A", "A", "B", "B"],
+            "x": [0.0, 1.0, 0.0, 1.0],
+            "y": [0.0, 0.0, 1.0, 1.0],
+        },
+        index=["c1", "c2", "c3", "c4"],
+    )
+    Y = np.full((4, 3), 2.0, dtype=float)
+    radii = [10.0, 20.0, 30.0]
+    entropy = compute_global_shannon_entropy(meta["cell_type"])
+
+    shared_default = prepare_shared_components(
+        response_matrix=Y,
+        metadata_df=meta,
+        radius_values=radii,
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=2,
+    )
+    assert np.isclose(shared_default["response_normalization_factor"], entropy)
+    assert np.allclose(shared_default["Y"], Y / entropy)
+
+    shared_fixed = prepare_shared_components(
+        response_matrix=Y,
+        metadata_df=meta,
+        radius_values=radii,
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=2,
+        normalize_by=5.0,
+    )
+    assert np.isclose(shared_fixed["response_normalization_factor"], 5.0)
+    assert np.allclose(shared_fixed["Y"], Y / 5.0)
+
+    shared_raw = prepare_shared_components(
+        response_matrix=Y,
+        metadata_df=meta,
+        radius_values=radii,
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=2,
+        normalize_by_global_entropy=False,
+    )
+    assert shared_raw["response_normalization_factor"] is None
+    assert np.allclose(shared_raw["Y"], Y)

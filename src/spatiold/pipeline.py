@@ -229,8 +229,14 @@ def prepare_shared_components(
     n_radius_knots: int = 5,
     spline_degree: int = 3,
     poly_degree: int = 3,
+    normalize_by: float | None = None,
+    normalize_by_global_entropy: bool = True,
 ) -> dict[str, Any]:
-    """Prepare shared design components for per-gene radius model fitting."""
+    """Prepare shared design components for per-gene radius model fitting.
+
+    By default, response values are normalized by sample-level global entropy
+    of `cell_type_col` to improve comparability across samples.
+    """
     Y = np.asarray(response_matrix, dtype=float)
     n_cells, n_radii = Y.shape
     radius_values = np.asarray(radius_values, dtype=float)
@@ -243,13 +249,27 @@ def prepare_shared_components(
         raise KeyError(f"`{cell_type_col}` not found in metadata_df.")
 
     meta = metadata_df.copy()
+    cell_types = meta[cell_type_col].astype(str)
+
+    norm_factor = normalize_by
+    if norm_factor is not None:
+        norm_factor = float(norm_factor)
+        if not np.isfinite(norm_factor) or norm_factor <= 0:
+            raise ValueError("`normalize_by` must be a finite positive value.")
+    elif normalize_by_global_entropy:
+        entropy = compute_global_shannon_entropy(cell_types)
+        if np.isfinite(entropy) and entropy > 0:
+            norm_factor = float(entropy)
+
+    if norm_factor is not None:
+        Y = Y / norm_factor
+
     if cell_id_col is None or cell_id_col not in meta.columns:
         meta["_cell_id_internal"] = np.arange(n_cells)
         cell_id_col_use = "_cell_id_internal"
     else:
         cell_id_col_use = cell_id_col
 
-    cell_types = meta[cell_type_col].astype(str)
     if reference_cell_type is None:
         reference_cell_type = cell_types.value_counts().idxmax()
 
@@ -313,6 +333,7 @@ def prepare_shared_components(
         "radius_feature_names": radius_feature_names,
         "radius_mode": radius_mode,
         "radius_transformer": radius_transformer,
+        "response_normalization_factor": norm_factor,
     }
 
 

@@ -111,19 +111,16 @@ def main() -> None:
     # 1) Local diversity + permutation
     # ------------------------------------------------------------------
     ld_df = obj.compute_local_diversity(radii=radii, key="ld_full")
-    pvals_df = obj.compute_permutation_pvals(
+    perm_stats = obj.compute_permutation_stats(
         n_perm=args.n_perm,
         radii=radii,
         random_state=args.seed,
         n_jobs=1,
-        key="ld_pvals",
+        pvals_key="ld_pvals",
+        perm_mean_key="ld_perm_mean",
     )
-    perm_dist = obj.compute_permutation_distribution(
-        n_perm=args.n_perm,
-        radii=radii,
-        random_state=args.seed,
-        n_jobs=1,
-    )
+    pvals_df = perm_stats["pvals"]
+    perm_dist = perm_stats["distribution"]
 
     entropy_global = obj.compute_global_shannon_entropy()
     summary_ct = obj.summarize_local_diversity_by_cell_type(
@@ -150,6 +147,7 @@ def main() -> None:
         local_diversity_key="ld_full",
         radius_mode="poly",
         poly_degree=3,
+        normalize_by_global_entropy=True,
     )
     results_df, fit_objects = sld.fit_all_genes(
         expr_model_df,

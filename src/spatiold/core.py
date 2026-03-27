@@ -19,6 +19,7 @@ from .permutation import (
     compute_nd_permutation_distribution,
     compute_nd_permutation_mean,
     compute_nd_permutation_pvals,
+    compute_nd_permutation_stats,
 )
 from .pipeline import (
     build_significance_mask as _build_significance_mask,
@@ -217,6 +218,37 @@ class SpatioLD:
             store_matrix_in_anndata(self.adata, pval_df, key=key)
         return pval_df
 
+    def compute_permutation_stats(
+        self,
+        n_perm: int,
+        *,
+        radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
+        random_state: int = 42,
+        n_jobs: int | None = None,
+        include_self: bool = True,
+        base: float = 2.0,
+        alternative: str = "greater",
+        store: bool = True,
+        pvals_key: str = "spatiold_local_diversity_pvals",
+        perm_mean_key: str = "spatiold_local_diversity_perm_mean",
+    ) -> dict[str, pd.DataFrame | np.ndarray]:
+        """Compute p-values, null mean, and permutation distribution in one run."""
+        stats = compute_nd_permutation_stats(
+            self.coords,
+            self.labels,
+            n_perm=n_perm,
+            radii=radii,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            include_self=include_self,
+            base=base,
+            alternative=alternative,
+        )
+        if store:
+            store_matrix_in_anndata(self.adata, stats["pvals"], key=pvals_key)
+            store_matrix_in_anndata(self.adata, stats["perm_mean"], key=perm_mean_key)
+        return stats
+
     def compute_permutation_mean(
         self,
         n_perm: int,
@@ -363,8 +395,14 @@ class SpatioLD:
         n_radius_knots: int = 5,
         spline_degree: int = 3,
         poly_degree: int = 3,
+        normalize_by: float | None = None,
+        normalize_by_global_entropy: bool = True,
     ) -> dict[str, Any]:
-        """Prepare shared components for gene-radius modeling using object data."""
+        """Prepare shared components for gene-radius modeling using object data.
+
+        By default, local-diversity response is normalized by object-level
+        global Shannon entropy before regression.
+        """
         if response_matrix is None:
             response_df = self.get_result(local_diversity_key)
             response_matrix = response_df.values
@@ -386,6 +424,8 @@ class SpatioLD:
             n_radius_knots=n_radius_knots,
             spline_degree=spline_degree,
             poly_degree=poly_degree,
+            normalize_by=normalize_by,
+            normalize_by_global_entropy=normalize_by_global_entropy,
         )
 
     def compute_svg_morans_i(

@@ -7,6 +7,7 @@ from spatiold import (
     compute_nd_permutation_distribution,
     compute_nd_permutation_mean,
     compute_nd_permutation_pvals,
+    compute_nd_permutation_stats,
 )
 
 
@@ -68,3 +69,22 @@ def test_permutation_distribution_shape() -> None:
 
     assert dist.shape == (12, 2, 4)
     assert np.isfinite(dist).all()
+
+
+def test_combined_permutation_stats_shape() -> None:
+    coords = pd.DataFrame({"x": [0, 0, 1, 1], "y": [0, 1, 0, 1]})
+    labels = pd.Series(["A", "A", "B", "B"], index=[f"c{i}" for i in range(4)])
+
+    stats = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=10,
+        radii=[0.5, 2.0],
+        random_state=5,
+        n_jobs=1,
+    )
+
+    assert set(stats.keys()) == {"pvals", "perm_mean", "distribution"}
+    assert stats["pvals"].shape == (4, 2)
+    assert stats["perm_mean"].shape == (4, 2)
+    assert stats["distribution"].shape == (10, 2, 4)

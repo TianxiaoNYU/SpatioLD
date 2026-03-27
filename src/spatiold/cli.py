@@ -129,10 +129,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k-values", nargs="+", type=int, default=[2, 3, 4, 5], help="K values for local-diversity profile clustering.")
     parser.add_argument("--svg-k", type=int, default=15, help="kNN size for Moran's I SVG score.")
 
-    parser.add_argument("--radius-mode", type=str, choices=["spline", "poly"], default="poly", help="Radius basis mode for gene model.")
+    parser.add_argument("--radius-mode", type=str, choices=["spline", "poly"], default="spline", help="Radius basis mode for gene model.")
     parser.add_argument("--poly-degree", type=int, default=3, help="Polynomial degree when `--radius-mode poly`.")
     parser.add_argument("--n-radius-knots", type=int, default=5, help="Spline knots when `--radius-mode spline`.")
     parser.add_argument("--spline-degree", type=int, default=3, help="Spline degree when `--radius-mode spline`.")
+    parser.add_argument(
+        "--regression-normalize-by",
+        type=float,
+        default=None,
+        help="Optional fixed divisor for local-diversity response before gene modeling. If omitted, global entropy normalization is used.",
+    )
+    parser.add_argument(
+        "--no-regression-entropy-normalize",
+        action="store_true",
+        help="Disable default global-entropy normalization of local-diversity response in gene modeling.",
+    )
     parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
 
     parser.add_argument("--save-permutation-distribution", action="store_true", help="Also save full permutation distribution to `.npz`.")
@@ -198,26 +209,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
     perm_mean_key = "spatiold_local_diversity_perm_mean"
 
     ld_df = obj.compute_local_diversity(radii=radii, key=ld_key)
-    pvals_df = obj.compute_permutation_pvals(
+    perm_stats = obj.compute_permutation_stats(
         n_perm=args.n_perm,
         radii=radii,
         random_state=args.random_state,
-        n_jobs=1,
-        key=pval_key,
+        n_jobs=-1,
+        store=True,
+        pvals_key=pval_key,
+        perm_mean_key=perm_mean_key,
     )
-    perm_mean_df = obj.compute_permutation_mean(
-        n_perm=args.n_perm,
-        radii=radii,
-        random_state=args.random_state,
-        n_jobs=1,
-        key=perm_mean_key,
-    )
-    perm_dist = obj.compute_permutation_distribution(
-        n_perm=args.n_perm,
-        radii=radii,
-        random_state=args.random_state,
-        n_jobs=1,
-    )
+    pvals_df = perm_stats["pvals"]
+    perm_mean_df = perm_stats["perm_mean"]
+    perm_dist = perm_stats["distribution"]
 
     summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
     summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
@@ -235,6 +238,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         poly_degree=args.poly_degree,
         n_radius_knots=args.n_radius_knots,
         spline_degree=args.spline_degree,
+        normalize_by=args.regression_normalize_by,
+        normalize_by_global_entropy=not args.no_regression_entropy_normalize,
     )
     results_df, _ = fit_all_genes(
         expr_model,

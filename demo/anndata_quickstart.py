@@ -31,15 +31,23 @@ ld_df = obj.compute_local_diversity(radii=[0.25, 1.2], key="ld_demo")
 print("Local diversity:")
 print(ld_df.round(3))
 
-pval_df = obj.compute_permutation_pvals(
+perm_stats = obj.compute_permutation_stats(
     n_perm=100,
     radii=[1.2],
     random_state=11,
     n_jobs=1,
-    key="ld_pvals_demo",
+    pvals_key="ld_pvals_demo",
+    perm_mean_key="ld_perm_mean_demo",
 )
+pval_df = perm_stats["pvals"]
+perm_mean_df = perm_stats["perm_mean"]
+perm_dist = perm_stats["distribution"]
+
 print("\nPermutation p-values:")
 print(pval_df.round(3))
+print("\nPermutation null mean:")
+print(perm_mean_df.round(3))
+print(f"\nPermutation distribution shape: {perm_dist.shape}")
 
 # Recover stored matrix from adata.obsm through SpatioLD helper
 reloaded = obj.get_result("ld_demo")

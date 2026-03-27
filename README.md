@@ -74,8 +74,14 @@ import spatiold as sld
 
 # assume obj = SpatioLD.from_arrays(...) or SpatioLD.from_anndata(...)
 ld_df = obj.compute_local_diversity(radii=[30, 60, 90], key="ld_full")
-pvals_df = obj.compute_permutation_pvals(n_perm=100, radii=[30, 60, 90], key="ld_pvals")
-perm_dist = obj.compute_permutation_distribution(n_perm=100, radii=[30, 60, 90])
+perm_stats = obj.compute_permutation_stats(
+    n_perm=100,
+    radii=[30, 60, 90],
+    pvals_key="ld_pvals",
+    perm_mean_key="ld_perm_mean",
+)
+pvals_df = perm_stats["pvals"]
+perm_dist = perm_stats["distribution"]
 
 # summaries and clustering from object-held results
 entropy = obj.compute_global_shannon_entropy()
@@ -89,6 +95,8 @@ shared = obj.prepare_shared_components(
     local_diversity_key="ld_full",
     radius_mode="poly",
     poly_degree=3,
+    # default: divide local diversity by global Shannon entropy
+    normalize_by_global_entropy=True,
 )
 results_df, fit_objects = sld.fit_all_genes(expr_df, shared)
 
@@ -106,7 +114,7 @@ spatiold-pipeline \
   --metadata /path/to/metadata.csv \
   --expression /path/to/expression.csv \
   --output-dir /path/to/output \
-  --radii 30 60 90 120 150 180 210 240 270
+  --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10
 ```
 
 Equivalent module form:
@@ -131,6 +139,8 @@ Common optional inputs (dataset-dependent):
 - `--cell-id-col` if cell IDs are not in index/`unique_id`
 - `--x-col`, `--y-col`, `--cell-type-col` if metadata columns use different names
 - `--n-perm`, `--n-model-genes` for runtime control
+- `--regression-normalize-by` or `--no-regression-entropy-normalize` to control
+  response normalization in gene-radius regression
 
 ## Main Modules
 
