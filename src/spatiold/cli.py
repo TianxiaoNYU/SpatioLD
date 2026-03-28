@@ -11,10 +11,14 @@ import numpy as np
 import pandas as pd
 
 from .core import SpatioLD
+from .diversity import compute_local_diversity_multi_radius
 from .pipeline import (
     align_expression_and_metadata,
+    compute_hvg_scanpy,
     fit_all_genes,
+    fit_single_gene_radius_model,
     fit_slide_level_cell_type_radius_model,
+    prepare_shared_components,
     preprocess_expression_matrix,
     summarize_model_terms,
     summarize_slide_level_cell_type_effects,
@@ -53,7 +57,7 @@ def _load_metadata(
     cell_id_col: str | None,
     x_col: str,
     y_col: str,
-    cell_type_col: str,
+    cell_type_col: str | None,
 ) -> pd.DataFrame:
     meta = _read_table(metadata_path, index_col=None)
 
@@ -66,7 +70,9 @@ def _load_metadata(
     elif meta.index.name is None:
         meta.index = meta.index.astype(str)
 
-    required = [x_col, y_col, cell_type_col]
+    required = [x_col, y_col]
+    if cell_type_col is not None:
+        required.append(cell_type_col)
     missing = [c for c in required if c not in meta.columns]
     if missing:
         raise KeyError(f"Metadata missing required columns: {missing}")
@@ -177,6 +183,65 @@ def build_slim_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_cluster_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run leave-one-gene-out cluster-label SpatioLD workflow (no cell-type labels required)."
+        )
+    )
+    parser.add_argument("--metadata", type=Path, required=True, help="Metadata path (.csv/.tsv/.txt/.parquet) with coordinates.")
+    parser.add_argument("--expression", type=Path, required=True, help="Expression matrix path (.csv/.tsv/.txt/.parquet).")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write workflow outputs.")
+    parser.add_argument(
+        "--radii",
+        nargs="+",
+        default=[str(r) for r in DEFAULT_RADII],
+        help="Radii as space-separated values (e.g. --radii 30 60 90) or comma list (e.g. --radii 30,60,90).",
+    )
+    parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
+    parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
+    parser.add_argument("--y-col", type=str, default="y", help="Metadata y-coordinate column.")
+
+    parser.add_argument("--min-fraction-expressed", type=float, default=0.02, help="Gene filter: minimum fraction of cells with nonzero expression.")
+    parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
+    parser.add_argument("--n-top-hvg", type=int, default=100, help="Top HVGs used for leave-one-gene-out modeling.")
+    parser.add_argument("--hvg-flavor", type=str, default="seurat", help="Scanpy HVG flavor (default: seurat).")
+
+    parser.add_argument("--cluster-method", type=str, choices=["scanpy-leiden"], default="scanpy-leiden", help="Clustering backend (default: scanpy-leiden).")
+    parser.add_argument(
+        "--cluster-n-clusters",
+        type=int,
+        default=None,
+        help=(
+            "Optional direct number of clusters. "
+            "If provided, this takes priority over `--cluster-resolution`."
+        ),
+    )
+    parser.add_argument("--cluster-resolution", type=float, default=2.0, help="Leiden resolution. Keep default for now; exposed for future tuning.")
+    parser.add_argument("--cluster-n-neighbors", type=int, default=15, help="Neighbors for clustering graph construction.")
+    parser.add_argument("--cluster-n-pcs", type=int, default=30, help="PCA components for clustering graph construction.")
+    parser.add_argument("--random-state", type=int, default=42, help="Random seed for clustering.")
+
+    parser.add_argument("--radius-mode", type=str, choices=["spline", "poly"], default="spline", help="Radius basis mode for gene model.")
+    parser.add_argument("--poly-degree", type=int, default=3, help="Polynomial degree when `--radius-mode poly`.")
+    parser.add_argument("--n-radius-knots", type=int, default=5, help="Spline knots when `--radius-mode spline`.")
+    parser.add_argument("--spline-degree", type=int, default=3, help="Spline degree when `--radius-mode spline`.")
+    parser.add_argument(
+        "--regression-normalize-by",
+        type=float,
+        default=None,
+        help="Optional fixed divisor for local-diversity response before modeling. If omitted, global entropy normalization is used.",
+    )
+    parser.add_argument(
+        "--no-regression-entropy-normalize",
+        action="store_true",
+        help="Disable default global-entropy normalization of local-diversity response in modeling.",
+    )
+    parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
+    parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
+    return parser
+
+
 def _build_sample_only_null_summary(local_diversity_df: pd.DataFrame) -> pd.DataFrame:
     obs = local_diversity_df.to_numpy(dtype=float)
     return pd.DataFrame(
@@ -189,6 +254,112 @@ def _build_sample_only_null_summary(local_diversity_df: pd.DataFrame) -> pd.Data
             "null_ci_high": np.nan,
         }
     )
+
+
+def _cluster_cells_scanpy_leiden(
+    expr_df: pd.DataFrame,
+    *,
+    random_state: int,
+    n_neighbors: int,
+    n_pcs: int,
+    resolution: float,
+    n_clusters: int | None,
+) -> pd.Series:
+    if n_clusters is not None and int(n_clusters) < 2:
+        raise ValueError("`n_clusters` must be >= 2 when provided.")
+
+    try:
+        import scanpy as sc
+    except ImportError:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+
+        X = np.log1p(expr_df.to_numpy(dtype=float))
+        X = StandardScaler(with_mean=True, with_std=True).fit_transform(X)
+        n_clusters_use = (
+            int(n_clusters)
+            if n_clusters is not None
+            else int(max(2, min(expr_df.shape[0], round(max(2.0, 4.0 * float(resolution))))))
+        )
+        km = KMeans(n_clusters=n_clusters_use, random_state=random_state, n_init=20)
+        labels = pd.Series(km.fit_predict(X).astype(str), index=expr_df.index.astype(str), name="cluster_label")
+        return labels
+
+    if expr_df.shape[0] < 2:
+        raise ValueError("Need at least 2 cells for clustering.")
+
+    adata = ad.AnnData(X=expr_df.to_numpy(dtype=np.float32))
+    adata.obs_names = expr_df.index.astype(str)
+    adata.var_names = expr_df.columns.astype(str)
+
+    # sc.pp.normalize_total(adata, target_sum=1e4)
+    # sc.pp.log1p(adata)
+    ## Skip normalization/logging since we're only using this for clustering, not modeling. 
+    ## Also align with the non-normalized expression used for regression in the cluster-label workflow.
+
+    n_neighbors_use = int(max(1, min(n_neighbors, adata.n_obs - 1)))
+    max_pcs = int(min(adata.n_obs - 1, adata.n_vars - 1))
+    if max_pcs >= 1:
+        n_pcs_use = int(max(1, min(n_pcs, max_pcs)))
+        sc.tl.pca(adata, n_comps=n_pcs_use, svd_solver="arpack")
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors_use, n_pcs=n_pcs_use)
+    else:
+        sc.pp.neighbors(adata, n_neighbors=n_neighbors_use, use_rep="X")
+
+    # Priority rule: if explicit cluster count is given, use it directly.
+    if n_clusters is not None:
+        from sklearn.cluster import KMeans
+
+        X_cluster = adata.obsm["X_pca"] if "X_pca" in adata.obsm else np.asarray(adata.X)
+        n_clusters_use = int(min(max(2, int(n_clusters)), adata.n_obs))
+        km = KMeans(n_clusters=n_clusters_use, random_state=random_state, n_init=20)
+        labels = pd.Series(km.fit_predict(X_cluster).astype(str), index=adata.obs_names, name="cluster_label")
+        labels.index = labels.index.astype(str)
+        return labels
+
+    try:
+        sc.tl.leiden(adata, resolution=float(resolution), key_added="cluster_label", random_state=random_state)
+        labels = adata.obs["cluster_label"].astype(str)
+    except Exception:
+        from sklearn.cluster import KMeans
+
+        X_cluster = adata.obsm["X_pca"] if "X_pca" in adata.obsm else np.asarray(adata.X)
+        n_clusters = int(max(2, min(adata.n_obs, round(max(2.0, 4.0 * float(resolution))))))
+        km = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=20)
+        labels = pd.Series(km.fit_predict(X_cluster).astype(str), index=adata.obs_names, name="cluster_label")
+
+    labels.index = labels.index.astype(str)
+    return labels
+
+
+def _select_hvg_with_fallback(
+    expr_df: pd.DataFrame,
+    *,
+    n_top_hvg: int,
+    hvg_flavor: str,
+    quiet: bool,
+) -> pd.DataFrame:
+    try:
+        return compute_hvg_scanpy(
+            expr_df,
+            n_top_genes=n_top_hvg,
+            flavor=hvg_flavor,
+        )
+    except ImportError:
+        if not quiet:
+            print("scanpy not available; falling back to variance-ranked HVGs.")
+
+        mean_s = expr_df.mean(axis=0)
+        var_s = expr_df.var(axis=0, ddof=0)
+        disp = var_s / np.maximum(mean_s, 1e-12)
+        hvg_df = pd.DataFrame(
+            {
+                "means": mean_s,
+                "dispersions": disp,
+                "dispersions_norm": disp,
+            }
+        ).sort_values("dispersions_norm", ascending=False)
+        return hvg_df.head(n_top_hvg)
 
 
 def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) -> None:
@@ -347,6 +518,155 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         print(f"Radii: {radii}")
 
 
+def run_cluster_pipeline(args: argparse.Namespace) -> None:
+    if not args.metadata.exists():
+        raise FileNotFoundError(f"Metadata file not found: {args.metadata}")
+    if not args.expression.exists():
+        raise FileNotFoundError(f"Expression file not found: {args.expression}")
+
+    radii = _parse_radii(args.radii)
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    meta_raw = _load_metadata(
+        args.metadata,
+        cell_id_col=args.cell_id_col,
+        x_col=args.x_col,
+        y_col=args.y_col,
+        cell_type_col=None,
+    )
+    expr_raw = _load_expression(args.expression)
+    expr = _orient_expression(expr_raw, meta_raw.index)
+
+    expr_filt = preprocess_expression_matrix(
+        expr,
+        min_fraction_expressed=args.min_fraction_expressed,
+        min_genes_per_cell=args.min_genes_per_cell,
+    )
+    expr_aligned, meta_aligned = align_expression_and_metadata(expr_filt, meta_raw)
+    if expr_aligned.empty or meta_aligned.empty:
+        raise ValueError("No overlapping cells found between metadata and expression after filtering/alignment.")
+
+    n_top_hvg = int(max(2, min(args.n_top_hvg, expr_aligned.shape[1])))
+    hvg_df = _select_hvg_with_fallback(
+        expr_aligned,
+        n_top_hvg=n_top_hvg,
+        hvg_flavor=args.hvg_flavor,
+        quiet=args.quiet,
+    )
+    hvg_genes = hvg_df.index.astype(str).tolist()
+    if len(hvg_genes) < 2:
+        raise ValueError("Need at least 2 HVGs for leave-one-gene-out clustering.")
+
+    expr_hvg = expr_aligned.loc[:, hvg_genes].copy()
+    coords_df = meta_aligned[[args.x_col, args.y_col]].copy()
+
+    summaries: list[dict[str, float | str | int]] = []
+    cluster_meta_by_gene_df = pd.DataFrame(index=expr_hvg.index.astype(str))
+    n_genes = expr_hvg.shape[1]
+    for k, gene in enumerate(expr_hvg.columns, start=1):
+        if not args.quiet:
+            print(f"Leave-one-gene-out fit {k}/{n_genes}: {gene}")
+
+        expr_wo_gene = expr_aligned.copy()
+        expr_wo_gene.drop(columns=[gene], inplace=True)
+
+        if args.cluster_method != "scanpy-leiden":
+            raise ValueError(f"Unsupported cluster method: {args.cluster_method}")
+        cluster_labels = _cluster_cells_scanpy_leiden(
+            expr_wo_gene,
+            random_state=args.random_state,
+            n_neighbors=args.cluster_n_neighbors,
+            n_pcs=args.cluster_n_pcs,
+            resolution=args.cluster_resolution,
+            n_clusters=args.cluster_n_clusters,
+        )
+        cluster_meta_by_gene_df[str(gene)] = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str)
+
+        ld_df = compute_local_diversity_multi_radius(
+            coords_df.loc[cluster_labels.index],
+            cluster_labels,
+            radii=radii,
+        )
+        cluster_meta = pd.DataFrame({"cluster_label": cluster_labels})
+
+        shared = prepare_shared_components(
+            response_matrix=ld_df.values,
+            metadata_df=cluster_meta,
+            radius_values=radii,
+            cell_type_col="cluster_label",
+            radius_mode=args.radius_mode,
+            poly_degree=args.poly_degree,
+            n_radius_knots=args.n_radius_knots,
+            spline_degree=args.spline_degree,
+            normalize_by=args.regression_normalize_by,
+            normalize_by_global_entropy=not args.no_regression_entropy_normalize,
+        )
+        fit_res = fit_single_gene_radius_model(
+            gene_values=expr_hvg.loc[cluster_labels.index, gene].values,
+            shared=shared,
+            cluster_robust=not args.no_cluster_robust,
+        )
+
+        coef = fit_res["coef"]
+        se = fit_res["se"]
+        pval = fit_res["pval"]
+        beta_gene = float(coef["gene"])
+        se_gene = float(se["gene"])
+        summaries.append(
+            {
+                "gene": str(gene),
+                "beta_gene": beta_gene,
+                "se_gene": se_gene,
+                "pval_gene": float(pval["gene"]),
+                "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
+                "r2": float(fit_res["fit"].rsquared),
+                "adj_r2": float(fit_res["fit"].rsquared_adj),
+                "aic": float(fit_res["fit"].aic),
+                "bic": float(fit_res["fit"].bic),
+                "n_clusters": int(cluster_labels.nunique()),
+            }
+        )
+
+    results_df = pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
+    hvg_out = hvg_df.copy()
+    hvg_out["gene"] = hvg_out.index.astype(str)
+    hvg_out = hvg_out.reset_index(drop=True)
+
+    results_df.to_csv(output_dir / "cluster_gene_ld_model_results.csv", index=False)
+    hvg_out.to_csv(output_dir / "hvg_selected.csv", index=False)
+    cluster_meta_by_gene_df.to_csv(output_dir / "cluster_meta_by_gene.csv")
+    _write_args_snapshot(args, output_dir, radii, permutation_enabled=False)
+
+    summary_payload = {
+        "workflow": "cluster_ld_leave_one_gene_out",
+        "n_cells": int(expr_aligned.shape[0]),
+        "n_genes_after_filter": int(expr_aligned.shape[1]),
+        "n_top_hvg_requested": int(args.n_top_hvg),
+        "n_hvg_used": int(expr_hvg.shape[1]),
+        "cluster_method": str(args.cluster_method),
+        "cluster_n_clusters": (
+            int(args.cluster_n_clusters) if args.cluster_n_clusters is not None else None
+        ),
+        "cluster_resolution": float(args.cluster_resolution),
+        "cluster_n_neighbors": int(args.cluster_n_neighbors),
+        "cluster_n_pcs": int(args.cluster_n_pcs),
+        "n_radii": int(len(radii)),
+        "radii": radii,
+    }
+    (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
+
+    if not args.quiet:
+        print("SpatioLD cluster-label workflow complete.")
+        print(f"Metadata: {args.metadata}")
+        print(f"Expression: {args.expression}")
+        print(f"Output dir: {output_dir}")
+        print(f"Cells used: {expr_aligned.shape[0]}")
+        print(f"Genes after filter: {expr_aligned.shape[1]}")
+        print(f"HVGs modeled: {expr_hvg.shape[1]}")
+        print(f"Radii: {radii}")
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -357,6 +677,12 @@ def main_slim() -> None:
     parser = build_slim_parser()
     args = parser.parse_args()
     run_pipeline(args, skip_permutation=True)
+
+
+def main_cluster() -> None:
+    parser = build_cluster_parser()
+    args = parser.parse_args()
+    run_cluster_pipeline(args)
 
 
 if __name__ == "__main__":

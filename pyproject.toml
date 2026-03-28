@@ -33,6 +33,7 @@ dev = [
 [project.scripts]
 spatiold-pipeline = "spatiold.cli:main"
 spatiold-pipeline-slim = "spatiold.cli:main_slim"
+spatiold-cluster = "spatiold.cli:main_cluster"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

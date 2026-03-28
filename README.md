@@ -133,6 +133,31 @@ spatiold-pipeline-slim \
 
 `spatiold-pipeline-slim` skips permutation p-value/null computation, while keeping preprocessing, local diversity, clustering, slide-level modeling, gene-radius modeling, and SVG scoring. Permutation-dependent output files are still written with placeholder values.
 
+For metadata without cell-type annotations, run the cluster-label workflow:
+
+```bash
+spatiold-cluster \
+  --metadata /path/to/metadata_xy_only.csv \
+  --expression /path/to/expression.csv \
+  --output-dir /path/to/output \
+  --radii 30 60 90 120 \
+  --n-top-hvg 100 \
+  --cluster-n-clusters 8
+```
+
+`spatiold-cluster` uses top HVGs, then for each gene performs leave-one-gene-out clustering (default `scanpy-leiden`) to generate cluster labels, computes LD from those labels, and fits the single-gene LD association model. Main outputs:
+
+- `cluster_gene_ld_model_results.csv`
+- `hvg_selected.csv`
+- `cluster_meta_by_gene.csv` (rows: cells, columns: gene IDs, values: leave-one-gene-out cluster labels)
+- `run_config.json`
+- `run_summary.json`
+
+Clustering controls:
+
+- `--cluster-n-clusters` directly sets cluster count and takes priority over `--cluster-resolution`.
+- `--cluster-resolution` is used when `--cluster-n-clusters` is not provided.
+
 Equivalent module form:
 
 ```bash
