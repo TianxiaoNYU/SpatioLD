@@ -52,7 +52,7 @@ def _entropy_from_labels(neighbor_labels: np.ndarray, base: float = 2.0) -> floa
     if neighbor_labels.size == 0:
         return 0.0
 
-    _, counts = np.unique(neighbor_labels, return_counts=True)
+    _, counts = np.unique(neighbor_labels.astype(str), return_counts=True)
     probs = counts / counts.sum()
     log_probs = np.log(probs)
     if base is not None:

@@ -102,6 +102,157 @@ def _orient_expression(expr_raw: pd.DataFrame, meta_index: pd.Index) -> pd.DataF
     return expr
 
 
+def _extract_expression_from_anndata(adata_obj, *, layer: str | None) -> pd.DataFrame:
+    if layer is None:
+        matrix = adata_obj.X
+    else:
+        if layer not in adata_obj.layers:
+            raise KeyError(f"`{layer}` not found in adata.layers.")
+        matrix = adata_obj.layers[layer]
+
+    if hasattr(matrix, "toarray"):
+        matrix = matrix.toarray()
+    matrix = np.asarray(matrix, dtype=float)
+
+    expr = pd.DataFrame(
+        matrix,
+        index=adata_obj.obs_names.astype(str),
+        columns=adata_obj.var_names.astype(str),
+    )
+    expr.index = expr.index.astype(str)
+    expr.columns = expr.columns.astype(str)
+    return expr
+
+
+def _extract_coords_from_anndata_for_cli(
+    adata_obj,
+    *,
+    x_col: str,
+    y_col: str,
+    spatial_key: str,
+) -> pd.DataFrame:
+    obs = adata_obj.obs.copy()
+    obs.index = adata_obj.obs_names.astype(str)
+    if x_col in obs.columns and y_col in obs.columns:
+        coords = obs[[x_col, y_col]].copy()
+        coords.index = coords.index.astype(str)
+        return coords
+
+    if spatial_key not in adata_obj.obsm:
+        raise KeyError(
+            f"Coordinates not found in adata.obs[['{x_col}', '{y_col}']] "
+            f"or adata.obsm['{spatial_key}']."
+        )
+    spatial = np.asarray(adata_obj.obsm[spatial_key])
+    if spatial.ndim != 2 or spatial.shape[1] < 2:
+        raise ValueError(
+            f"adata.obsm['{spatial_key}'] must have shape (n_cells, >=2). Got {spatial.shape}."
+        )
+
+    return pd.DataFrame(
+        spatial[:, :2].astype(float, copy=False),
+        index=adata_obj.obs_names.astype(str),
+        columns=[x_col, y_col],
+    )
+
+
+def _load_input_tables(
+    *,
+    metadata_path: Path | None,
+    expression_path: Path | None,
+    input_h5ad: Path | None,
+    cell_id_col: str | None,
+    x_col: str,
+    y_col: str,
+    cell_type_col: str | None,
+    spatial_key: str,
+    h5ad_layer: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str, str]:
+    h5ad_path = input_h5ad
+    if h5ad_path is None and metadata_path is not None and metadata_path.suffix.lower() == ".h5ad":
+        if expression_path is not None:
+            raise ValueError(
+                "When using an .h5ad input via --metadata, do not also provide --expression. "
+                "Use --h5ad-layer if needed."
+            )
+        h5ad_path = metadata_path
+
+    if h5ad_path is not None:
+        if not h5ad_path.exists():
+            raise FileNotFoundError(f"h5ad file not found: {h5ad_path}")
+
+        adata = ad.read_h5ad(h5ad_path)
+        meta = adata.obs.copy()
+        meta.index = adata.obs_names.astype(str)
+        expr = _extract_expression_from_anndata(adata, layer=h5ad_layer)
+
+        if cell_id_col is not None:
+            if cell_id_col not in meta.columns:
+                raise KeyError(f"`{cell_id_col}` not found in adata.obs columns.")
+            ids = meta[cell_id_col].astype(str)
+            if ids.duplicated().any():
+                raise ValueError(f"`{cell_id_col}` contains duplicated IDs in adata.obs.")
+            meta = meta.set_index(cell_id_col)
+            expr.index = ids.values
+        elif "unique_id" in meta.columns:
+            ids = meta["unique_id"].astype(str)
+            if ids.duplicated().any():
+                raise ValueError("`unique_id` contains duplicated IDs in adata.obs.")
+            meta = meta.set_index("unique_id")
+            expr.index = ids.values
+        else:
+            meta.index = meta.index.astype(str)
+            expr.index = expr.index.astype(str)
+
+        coords = _extract_coords_from_anndata_for_cli(
+            adata,
+            x_col=x_col,
+            y_col=y_col,
+            spatial_key=spatial_key,
+        )
+        coords.index = expr.index.astype(str)
+        for coord_col in [x_col, y_col]:
+            meta[coord_col] = coords.reindex(meta.index)[coord_col].values
+
+        required = [x_col, y_col]
+        if cell_type_col is not None:
+            required.append(cell_type_col)
+        missing = [c for c in required if c not in meta.columns]
+        if missing:
+            raise KeyError(f"Metadata missing required columns: {missing}")
+
+        meta = meta.dropna(subset=required).copy()
+        meta.index = meta.index.astype(str)
+        expr.index = expr.index.astype(str)
+
+        return (
+            meta,
+            expr,
+            str(h5ad_path),
+            f"{h5ad_path}::{h5ad_layer if h5ad_layer is not None else 'X'}",
+        )
+
+    if metadata_path is None or expression_path is None:
+        raise ValueError(
+            "Provide either --input-h5ad, or both --metadata and --expression."
+        )
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+    if not expression_path.exists():
+        raise FileNotFoundError(f"Expression file not found: {expression_path}")
+
+    meta = _load_metadata(
+        metadata_path,
+        cell_id_col=cell_id_col,
+        x_col=x_col,
+        y_col=y_col,
+        cell_type_col=cell_type_col,
+    )
+    expr_raw = _load_expression(expression_path)
+    expr = _orient_expression(expr_raw, meta.index)
+    return meta, expr, str(metadata_path), str(expression_path)
+
+
 def _write_args_snapshot(
     args: argparse.Namespace,
     output_dir: Path,
@@ -111,16 +262,45 @@ def _write_args_snapshot(
 ) -> None:
     payload = vars(args).copy()
     payload["radii"] = radii
-    payload["metadata"] = str(args.metadata)
-    payload["expression"] = str(args.expression)
+    payload["metadata"] = str(args.metadata) if getattr(args, "metadata", None) is not None else None
+    payload["expression"] = str(args.expression) if getattr(args, "expression", None) is not None else None
+    payload["input_h5ad"] = str(args.input_h5ad) if getattr(args, "input_h5ad", None) is not None else None
     payload["output_dir"] = str(args.output_dir)
     payload["permutation_enabled"] = permutation_enabled
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2))
 
 
 def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--metadata", type=Path, required=True, help="Metadata path (.csv/.tsv/.txt/.parquet).")
-    parser.add_argument("--expression", type=Path, required=True, help="Expression matrix path (.csv/.tsv/.txt/.parquet).")
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="Metadata path (.csv/.tsv/.txt/.parquet). Required unless --input-h5ad is provided.",
+    )
+    parser.add_argument(
+        "--expression",
+        type=Path,
+        default=None,
+        help="Expression matrix path (.csv/.tsv/.txt/.parquet). Required unless --input-h5ad is provided.",
+    )
+    parser.add_argument(
+        "--input-h5ad",
+        type=Path,
+        default=None,
+        help="Single AnnData input (.h5ad). When provided, metadata comes from `.obs` and expression from `.X` or --h5ad-layer.",
+    )
+    parser.add_argument(
+        "--h5ad-layer",
+        type=str,
+        default=None,
+        help="Optional AnnData layer name to use as expression matrix instead of `.X`.",
+    )
+    parser.add_argument(
+        "--spatial-key",
+        type=str,
+        default="spatial",
+        help="AnnData `.obsm` key for coordinates when --x-col/--y-col are not in `.obs`.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write pipeline outputs.")
 
     parser.add_argument(
@@ -134,6 +314,7 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
     parser.add_argument("--y-col", type=str, default="y", help="Metadata y-coordinate column.")
     parser.add_argument("--cell-type-col", type=str, default="cell_type", help="Metadata cell-type label column.")
+    parser.add_argument("--cell-size-col", type=str, default=None, help="Optional metadata column used as a numeric regression covariate.")
 
     parser.add_argument("--min-fraction-expressed", type=float, default=0.02, help="Gene filter: minimum fraction of cells with nonzero expression.")
     parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
@@ -189,8 +370,36 @@ def build_cluster_parser() -> argparse.ArgumentParser:
             "Run leave-one-gene-out cluster-label SpatioLD workflow (no cell-type labels required)."
         )
     )
-    parser.add_argument("--metadata", type=Path, required=True, help="Metadata path (.csv/.tsv/.txt/.parquet) with coordinates.")
-    parser.add_argument("--expression", type=Path, required=True, help="Expression matrix path (.csv/.tsv/.txt/.parquet).")
+    parser.add_argument(
+        "--metadata",
+        type=Path,
+        default=None,
+        help="Metadata path (.csv/.tsv/.txt/.parquet). Required unless --input-h5ad is provided.",
+    )
+    parser.add_argument(
+        "--expression",
+        type=Path,
+        default=None,
+        help="Expression matrix path (.csv/.tsv/.txt/.parquet). Required unless --input-h5ad is provided.",
+    )
+    parser.add_argument(
+        "--input-h5ad",
+        type=Path,
+        default=None,
+        help="Single AnnData input (.h5ad). When provided, metadata comes from `.obs` and expression from `.X` or --h5ad-layer.",
+    )
+    parser.add_argument(
+        "--h5ad-layer",
+        type=str,
+        default=None,
+        help="Optional AnnData layer name to use as expression matrix instead of `.X`.",
+    )
+    parser.add_argument(
+        "--spatial-key",
+        type=str,
+        default="spatial",
+        help="AnnData `.obsm` key for coordinates when --x-col/--y-col are not in `.obs`.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write workflow outputs.")
     parser.add_argument(
         "--radii",
@@ -201,6 +410,7 @@ def build_cluster_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
     parser.add_argument("--y-col", type=str, default="y", help="Metadata y-coordinate column.")
+    parser.add_argument("--cell-size-col", type=str, default=None, help="Optional metadata column used as a numeric regression covariate.")
 
     parser.add_argument("--min-fraction-expressed", type=float, default=0.02, help="Gene filter: minimum fraction of cells with nonzero expression.")
     parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
@@ -363,24 +573,21 @@ def _select_hvg_with_fallback(
 
 
 def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) -> None:
-    if not args.metadata.exists():
-        raise FileNotFoundError(f"Metadata file not found: {args.metadata}")
-    if not args.expression.exists():
-        raise FileNotFoundError(f"Expression file not found: {args.expression}")
-
     radii = _parse_radii(args.radii)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    meta_raw = _load_metadata(
-        args.metadata,
+    meta_raw, expr, metadata_source, expression_source = _load_input_tables(
+        metadata_path=args.metadata,
+        expression_path=args.expression,
+        input_h5ad=args.input_h5ad,
         cell_id_col=args.cell_id_col,
         x_col=args.x_col,
         y_col=args.y_col,
         cell_type_col=args.cell_type_col,
+        spatial_key=args.spatial_key,
+        h5ad_layer=args.h5ad_layer,
     )
-    expr_raw = _load_expression(args.expression)
-    expr = _orient_expression(expr_raw, meta_raw.index)
 
     expr_filt = preprocess_expression_matrix(
         expr,
@@ -451,6 +658,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         poly_degree=args.poly_degree,
         n_radius_knots=args.n_radius_knots,
         spline_degree=args.spline_degree,
+        covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
         normalize_by=args.regression_normalize_by,
         normalize_by_global_entropy=not args.no_regression_entropy_normalize,
     )
@@ -462,9 +670,16 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     slide_ct_effects_df = summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
 
     n_model_genes = max(1, min(int(args.n_model_genes), expr_aligned.shape[1]))
-    var_rank = expr_aligned.var(axis=0).sort_values(ascending=False)
-    model_genes = var_rank.head(n_model_genes).index
-    expr_model = expr_aligned.loc[:, model_genes].copy()
+    # var_rank = expr_aligned.var(axis=0).sort_values(ascending=False)
+    # model_genes = var_rank.head(n_model_genes).index
+    hvg_df = _select_hvg_with_fallback(
+        expr_aligned,
+        n_top_hvg=n_model_genes,
+        hvg_flavor="seurat",
+        quiet=args.quiet,
+    )
+    hvg_genes = hvg_df.index.astype(str).tolist()
+    expr_model = expr_aligned.loc[:, hvg_genes].copy()
 
     results_df, _ = fit_all_genes(
         expr_model,
@@ -498,6 +713,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         "n_cell_types": int(len(shared["cell_type_levels"])),
         "reference_cell_type": str(shared["reference_cell_type"]),
         "response_normalization_factor": shared["response_normalization_factor"],
+        "covariate_cols": shared.get("covariate_cols", []),
         "n_radii": int(len(radii)),
         "radii": radii,
         "permutation_enabled": not skip_permutation,
@@ -509,8 +725,8 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         mode = "full" if not skip_permutation else "slim (permutation skipped)"
         print("SpatioLD pipeline complete.")
         print(f"Mode: {mode}")
-        print(f"Metadata: {args.metadata}")
-        print(f"Expression: {args.expression}")
+        print(f"Metadata: {metadata_source}")
+        print(f"Expression: {expression_source}")
         print(f"Output dir: {output_dir}")
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")
@@ -519,24 +735,21 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
 
 
 def run_cluster_pipeline(args: argparse.Namespace) -> None:
-    if not args.metadata.exists():
-        raise FileNotFoundError(f"Metadata file not found: {args.metadata}")
-    if not args.expression.exists():
-        raise FileNotFoundError(f"Expression file not found: {args.expression}")
-
     radii = _parse_radii(args.radii)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    meta_raw = _load_metadata(
-        args.metadata,
+    meta_raw, expr, metadata_source, expression_source = _load_input_tables(
+        metadata_path=args.metadata,
+        expression_path=args.expression,
+        input_h5ad=args.input_h5ad,
         cell_id_col=args.cell_id_col,
         x_col=args.x_col,
         y_col=args.y_col,
         cell_type_col=None,
+        spatial_key=args.spatial_key,
+        h5ad_layer=args.h5ad_layer,
     )
-    expr_raw = _load_expression(args.expression)
-    expr = _orient_expression(expr_raw, meta_raw.index)
 
     expr_filt = preprocess_expression_matrix(
         expr,
@@ -589,6 +802,10 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             radii=radii,
         )
         cluster_meta = pd.DataFrame({"cluster_label": cluster_labels})
+        if args.cell_size_col is not None:
+            if args.cell_size_col not in meta_aligned.columns:
+                raise KeyError(f"`{args.cell_size_col}` not found in aligned metadata.")
+            cluster_meta[args.cell_size_col] = meta_aligned.loc[cluster_labels.index, args.cell_size_col].values
 
         shared = prepare_shared_components(
             response_matrix=ld_df.values,
@@ -599,6 +816,7 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             poly_degree=args.poly_degree,
             n_radius_knots=args.n_radius_knots,
             spline_degree=args.spline_degree,
+            covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
             normalize_by=args.regression_normalize_by,
             normalize_by_global_entropy=not args.no_regression_entropy_normalize,
         )
@@ -651,6 +869,7 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
         "cluster_resolution": float(args.cluster_resolution),
         "cluster_n_neighbors": int(args.cluster_n_neighbors),
         "cluster_n_pcs": int(args.cluster_n_pcs),
+        "covariate_cols": [args.cell_size_col] if args.cell_size_col is not None else [],
         "n_radii": int(len(radii)),
         "radii": radii,
     }
@@ -658,8 +877,8 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         print("SpatioLD cluster-label workflow complete.")
-        print(f"Metadata: {args.metadata}")
-        print(f"Expression: {args.expression}")
+        print(f"Metadata: {metadata_source}")
+        print(f"Expression: {expression_source}")
         print(f"Output dir: {output_dir}")
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")

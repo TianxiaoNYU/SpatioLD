@@ -20,7 +20,7 @@ def compute_global_shannon_entropy(
 ) -> float:
     """Compute global Shannon entropy of label composition."""
     labels_arr = np.asarray(labels)
-    _, counts = np.unique(labels_arr, return_counts=True)
+    _, counts = np.unique(labels_arr.astype(str), return_counts=True)
     probs = counts / counts.sum()
     log_probs = np.log(probs) / np.log(base)
     return float(-(probs * log_probs).sum())
@@ -229,6 +229,7 @@ def prepare_shared_components(
     n_radius_knots: int = 5,
     spline_degree: int = 3,
     poly_degree: int = 3,
+    covariate_cols: Sequence[str] | None = None,
     normalize_by: float | None = None,
     normalize_by_global_entropy: bool = True,
 ) -> dict[str, Any]:
@@ -250,6 +251,27 @@ def prepare_shared_components(
 
     meta = metadata_df.copy()
     cell_types = meta[cell_type_col].astype(str)
+
+    covariate_cols_use: list[str] = []
+    covariate_feature_names: list[str] = []
+    covariates_long = np.empty((n_cells * n_radii, 0), dtype=float)
+    if covariate_cols is not None:
+        covariate_cols_use = [str(c) for c in covariate_cols]
+        missing_covars = [c for c in covariate_cols_use if c not in meta.columns]
+        if missing_covars:
+            raise KeyError(f"Covariate columns not found in metadata_df: {missing_covars}")
+
+        cov_df = meta.loc[:, covariate_cols_use].apply(pd.to_numeric, errors="coerce")
+        bad_covars = [c for c in cov_df.columns if cov_df[c].isna().any()]
+        if bad_covars:
+            raise ValueError(
+                "Covariate columns must be numeric and non-missing. "
+                f"Problematic columns: {bad_covars}"
+            )
+
+        covariates = cov_df.to_numpy(dtype=float)
+        covariates_long = np.repeat(covariates, repeats=n_radii, axis=0)
+        covariate_feature_names = [f"covariate_{c}" for c in covariate_cols_use]
 
     norm_factor = normalize_by
     if norm_factor is not None:
@@ -327,6 +349,9 @@ def prepare_shared_components(
         "cell_type_col": cell_type_col,
         "cell_type_levels": ordered_ct,
         "groups_long": groups_long,
+        "covariate_cols": covariate_cols_use,
+        "covariates_long": covariates_long,
+        "covariate_feature_names": covariate_feature_names,
         "ct_long": ct_long,
         "ct_feature_names": ct_feature_names,
         "reference_cell_type": reference_cell_type,
@@ -360,8 +385,21 @@ def fit_single_gene_radius_model(
     n_radii = shared["n_radii"]
     x_long = np.repeat(x, repeats=n_radii).reshape(-1, 1)
 
-    X = np.hstack([x_long, shared["ct_long"], shared["radius_long"]])
-    feature_names = ["gene"] + shared["ct_feature_names"] + shared["radius_feature_names"]
+    covariates_long = np.asarray(
+        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
+        dtype=float,
+    )
+    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
+        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
+    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+
+    X = np.hstack([x_long, covariates_long, shared["ct_long"], shared["radius_long"]])
+    feature_names = (
+        ["gene"]
+        + covariate_feature_names
+        + shared["ct_feature_names"]
+        + shared["radius_feature_names"]
+    )
 
     if add_intercept:
         X = sms.add_constant(X, has_constant="add")
@@ -399,8 +437,16 @@ def fit_slide_level_cell_type_radius_model(
     """
     import statsmodels.api as sms
 
-    X = np.hstack([shared["ct_long"], shared["radius_long"]])
-    feature_names = shared["ct_feature_names"] + shared["radius_feature_names"]
+    covariates_long = np.asarray(
+        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
+        dtype=float,
+    )
+    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
+        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
+    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+
+    X = np.hstack([covariates_long, shared["ct_long"], shared["radius_long"]])
+    feature_names = covariate_feature_names + shared["ct_feature_names"] + shared["radius_feature_names"]
 
     if add_intercept:
         X = sms.add_constant(X, has_constant="add")

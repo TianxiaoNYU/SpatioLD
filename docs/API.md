@@ -57,7 +57,7 @@ Fundamental utilities:
 Gene-radius model utilities:
 
 - `make_spline_basis(radius_values, ...)`
-- `prepare_shared_components(response_matrix, metadata_df, radius_values, ..., normalize_by=None, normalize_by_global_entropy=True)`
+- `prepare_shared_components(response_matrix, metadata_df, radius_values, ..., covariate_cols=None, normalize_by=None, normalize_by_global_entropy=True)`
 - `fit_single_gene_radius_model(gene_values, shared, ...)`
 - `reconstruct_radius_effect(fit_result, shared, ...)`
 - `fit_all_genes(expr_df, shared, ...)`

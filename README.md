@@ -121,6 +121,16 @@ spatiold-pipeline \
   --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10
 ```
 
+Or run directly from a single AnnData file:
+
+```bash
+spatiold-pipeline \
+  --input-h5ad /path/to/data.h5ad \
+  --output-dir /path/to/output \
+  --cell-type-col cell_type \
+  --x-col x --y-col y
+```
+
 For faster iteration without permutation inference, use slim mode:
 
 ```bash
@@ -170,8 +180,7 @@ python -m spatiold.cli \
 
 Required inputs:
 
-- `--metadata`: metadata table
-- `--expression`: expression table
+- either `--input-h5ad` or both `--metadata` + `--expression`
 - `--output-dir`: directory for outputs
 - `--radii`: radius grid
 
@@ -179,6 +188,9 @@ Common optional inputs (dataset-dependent):
 
 - `--cell-id-col` if cell IDs are not in index/`unique_id`
 - `--x-col`, `--y-col`, `--cell-type-col` if metadata columns use different names
+- `--spatial-key` to read coordinates from `adata.obsm[spatial_key]` in `.h5ad`
+- `--h5ad-layer` to use an AnnData layer instead of `adata.X`
+- `--cell-size-col` to include cell size (or another numeric metadata column) as a regression covariate
 - `--n-perm`, `--n-model-genes` for runtime control
 - `--regression-normalize-by` or `--no-regression-entropy-normalize` to control
   response normalization in gene-radius regression

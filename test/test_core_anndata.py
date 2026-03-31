@@ -67,6 +67,7 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
             "x": rng.uniform(0, 100, size=n_cells),
             "y": rng.uniform(0, 100, size=n_cells),
             "cell_type": rng.choice(["A", "B", "C"], size=n_cells),
+            "cell_size": rng.uniform(80, 250, size=n_cells),
         },
         index=idx,
     )
@@ -110,7 +111,12 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
 
     cluster_df, models = obj.cluster_local_diversity_profiles(local_diversity_key="ld_full", k_values=(2, 3))
     mask = obj.build_significance_mask(pvals_key="pvals_full", alpha=0.05)
-    shared = obj.prepare_shared_components(local_diversity_key="ld_full", radius_mode="poly", poly_degree=2)
+    shared = obj.prepare_shared_components(
+        local_diversity_key="ld_full",
+        radius_mode="poly",
+        poly_degree=2,
+        covariate_cols=["cell_size"],
+    )
     slide_ct_fit = obj.fit_slide_level_cell_type_radius_model(shared=shared)
     slide_ct_terms = obj.summarize_model_terms(slide_ct_fit)
     slide_ct_effects = obj.summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
@@ -121,6 +127,7 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
     assert mask.shape == pvals.shape
     assert shared["n_cells"] == n_cells
     assert shared["n_radii"] == len(radii)
+    assert shared["covariate_feature_names"] == ["covariate_cell_size"]
     entropy = obj.compute_global_shannon_entropy()
     if entropy > 0:
         assert np.allclose(shared["Y"], ld.values / entropy)

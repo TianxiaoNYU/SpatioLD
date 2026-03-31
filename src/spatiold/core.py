@@ -398,6 +398,7 @@ class SpatioLD:
         n_radius_knots: int = 5,
         spline_degree: int = 3,
         poly_degree: int = 3,
+        covariate_cols: list[str] | tuple[str, ...] | None = None,
         normalize_by: float | None = None,
         normalize_by_global_entropy: bool = True,
     ) -> dict[str, Any]:
@@ -427,6 +428,7 @@ class SpatioLD:
             n_radius_knots=n_radius_knots,
             spline_degree=spline_degree,
             poly_degree=poly_degree,
+            covariate_cols=covariate_cols,
             normalize_by=normalize_by,
             normalize_by_global_entropy=normalize_by_global_entropy,
         )
@@ -445,6 +447,7 @@ class SpatioLD:
         n_radius_knots: int = 5,
         spline_degree: int = 3,
         poly_degree: int = 3,
+        covariate_cols: list[str] | tuple[str, ...] | None = None,
         normalize_by: float | None = None,
         normalize_by_global_entropy: bool = True,
         add_intercept: bool = True,
@@ -464,6 +467,7 @@ class SpatioLD:
                 n_radius_knots=n_radius_knots,
                 spline_degree=spline_degree,
                 poly_degree=poly_degree,
+                covariate_cols=covariate_cols,
                 normalize_by=normalize_by,
                 normalize_by_global_entropy=normalize_by_global_entropy,
             )

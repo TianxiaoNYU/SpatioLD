@@ -37,6 +37,7 @@ def _make_small_dataset() -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     )
     meta = coords.copy()
     meta["cell_type"] = labels
+    meta["cell_size"] = rng.uniform(50, 200, size=n)
     return coords, labels, meta
 
 
@@ -78,10 +79,12 @@ def test_gene_radius_model_and_svg() -> None:
         cell_type_col="cell_type",
         radius_mode="poly",
         poly_degree=2,
+        covariate_cols=["cell_size"],
     )
 
     fit = fit_single_gene_radius_model(expr["g0"].values, shared)
     assert "gene" in fit["coef"].index
+    assert "covariate_cell_size" in fit["coef"].index
 
     svg_df = compute_svg_morans_i(expr, coords)
     assert list(svg_df.columns) == ["gene", "moran_I"]
