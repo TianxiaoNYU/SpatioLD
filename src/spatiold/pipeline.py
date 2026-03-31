@@ -619,6 +619,365 @@ def fit_all_genes(
     return summary_df, fit_objects
 
 
+def _get_long_covariates_from_shared(shared: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    covariates_long = np.asarray(
+        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
+        dtype=float,
+    )
+    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
+        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
+    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+    return covariates_long, covariate_feature_names
+
+
+def fit_multi_gene_radius_model(
+    expr_df: pd.DataFrame,
+    shared: dict[str, Any],
+    gene_names: Sequence[str],
+    *,
+    add_intercept: bool = True,
+    cluster_robust: bool = True,
+) -> dict[str, Any]:
+    """Fit a multi-gene radius model using a fixed set of genes.
+
+    Model:
+        ``E_{i,r} = sum_g(beta_g * x_{i,g}) + cell_type_i + f(r) + error``
+    """
+    import statsmodels.api as sms
+
+    gene_names_use = [str(g) for g in gene_names]
+    if len(gene_names_use) == 0:
+        raise ValueError("`gene_names` must contain at least one gene.")
+
+    missing = [g for g in gene_names_use if g not in expr_df.columns]
+    if missing:
+        raise KeyError(f"Genes not found in expr_df: {missing}")
+    if len(expr_df) != shared["n_cells"]:
+        raise ValueError("`expr_df` must align with response matrix cell order.")
+
+    X_gene = expr_df.loc[:, gene_names_use].to_numpy(dtype=float, copy=False)
+    n_radii = int(shared["n_radii"])
+    X_gene_long = np.repeat(X_gene, repeats=n_radii, axis=0)
+
+    covariates_long, covariate_feature_names = _get_long_covariates_from_shared(shared)
+
+    X = np.hstack([X_gene_long, covariates_long, shared["ct_long"], shared["radius_long"]])
+    feature_names = (
+        [f"gene::{g}" for g in gene_names_use]
+        + covariate_feature_names
+        + shared["ct_feature_names"]
+        + shared["radius_feature_names"]
+    )
+
+    if add_intercept:
+        X = sms.add_constant(X, has_constant="add")
+        feature_names = ["const"] + feature_names
+
+    model = sms.OLS(shared["y_long"], X)
+    if cluster_robust:
+        fit_res = model.fit(cov_type="cluster", cov_kwds={"groups": shared["groups_long"]})
+    else:
+        fit_res = model.fit()
+
+    coef = pd.Series(fit_res.params, index=feature_names)
+    se = pd.Series(fit_res.bse, index=feature_names)
+    pval = pd.Series(fit_res.pvalues, index=feature_names)
+
+    return {
+        "fit": fit_res,
+        "coef": coef,
+        "se": se,
+        "pval": pval,
+        "feature_names": feature_names,
+        "selected_genes": gene_names_use,
+    }
+
+
+def summarize_multi_gene_gene_terms(
+    fit_result: dict[str, Any],
+    *,
+    sort_by_pval: bool = True,
+) -> pd.DataFrame:
+    """Extract per-gene terms from a fitted multi-gene model."""
+    coef = fit_result["coef"]
+    se = fit_result["se"]
+    pval = fit_result["pval"]
+    fit_obj = fit_result["fit"]
+
+    selected_genes = [str(g) for g in fit_result.get("selected_genes", [])]
+    rows: list[dict[str, Any]] = []
+    for rank, gene in enumerate(selected_genes, start=1):
+        term = f"gene::{gene}"
+        if term not in coef.index:
+            continue
+        beta_gene = float(coef[term])
+        se_gene = float(se[term])
+        rows.append(
+            {
+                "gene": gene,
+                "selection_step": rank,
+                "beta_gene": beta_gene,
+                "se_gene": se_gene,
+                "pval_gene": float(pval[term]),
+                "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
+                "r2": float(fit_obj.rsquared),
+                "adj_r2": float(fit_obj.rsquared_adj),
+                "aic": float(fit_obj.aic),
+                "bic": float(fit_obj.bic),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(
+            columns=[
+                "gene",
+                "selection_step",
+                "beta_gene",
+                "se_gene",
+                "pval_gene",
+                "t_gene",
+                "r2",
+                "adj_r2",
+                "aic",
+                "bic",
+            ]
+        )
+    if sort_by_pval:
+        out = out.sort_values("pval_gene").reset_index(drop=True)
+    return out
+
+
+def _extract_model_metric(fit_obj: Any, criterion: str) -> float:
+    crit = str(criterion).lower()
+    if crit == "bic":
+        return float(fit_obj.bic)
+    if crit == "aic":
+        return float(fit_obj.aic)
+    if crit == "adj_r2":
+        return float(fit_obj.rsquared_adj)
+    raise ValueError("`criterion` must be one of {'bic', 'aic', 'adj_r2'}.")
+
+
+def _metric_improved(
+    candidate_value: float,
+    current_value: float,
+    criterion: str,
+    *,
+    min_improvement: float,
+) -> tuple[bool, float]:
+    crit = str(criterion).lower()
+    if crit in {"bic", "aic"}:
+        improvement = current_value - candidate_value
+    elif crit == "adj_r2":
+        improvement = candidate_value - current_value
+    else:
+        raise ValueError("`criterion` must be one of {'bic', 'aic', 'adj_r2'}.")
+    return improvement > float(min_improvement), float(improvement)
+
+
+def forward_select_gene_set(
+    expr_df: pd.DataFrame,
+    shared: dict[str, Any],
+    *,
+    candidate_genes: Sequence[str] | None = None,
+    max_genes: int = 8,
+    selection_pool_size: int = 50,
+    criterion: str = "bic",
+    min_improvement: float = 0.0,
+    cluster_robust: bool = True,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Forward-select a compact multi-gene model.
+
+    Selection flow:
+        1) Fit base model (cell type + radius + optional covariates).
+        2) Screen genes by residual association to reduce candidate pool.
+        3) Run greedy forward selection on the screened pool.
+    """
+    if len(expr_df) != shared["n_cells"]:
+        raise ValueError("`expr_df` must align with response matrix cell order.")
+    if max_genes < 1:
+        raise ValueError("`max_genes` must be >= 1.")
+    if selection_pool_size < 1:
+        raise ValueError("`selection_pool_size` must be >= 1.")
+    if min_improvement < 0:
+        raise ValueError("`min_improvement` must be >= 0.")
+
+    if candidate_genes is None:
+        candidate = expr_df.columns.astype(str).tolist()
+    else:
+        candidate = [str(g) for g in candidate_genes]
+    if len(candidate) == 0:
+        raise ValueError("No candidate genes provided for forward selection.")
+
+    missing = [g for g in candidate if g not in expr_df.columns]
+    if missing:
+        raise KeyError(f"Candidate genes not found in expr_df: {missing}")
+
+    candidate = list(dict.fromkeys(candidate))
+    max_genes_use = int(min(max_genes, len(candidate)))
+
+    base_fit = fit_slide_level_cell_type_radius_model(
+        shared,
+        cluster_robust=cluster_robust,
+    )
+    current_fit = base_fit
+    current_metric = _extract_model_metric(base_fit["fit"], criterion)
+
+    resid_long = np.asarray(base_fit["fit"].resid, dtype=float).reshape(-1)
+    if resid_long.shape[0] != shared["y_long"].shape[0]:
+        raise ValueError("Base-model residual length mismatch.")
+    resid_by_cell = resid_long.reshape(shared["n_cells"], shared["n_radii"])
+    resid_cell_sum = resid_by_cell.sum(axis=1)
+
+    Xcand = expr_df.loc[:, candidate].to_numpy(dtype=float, copy=False)
+    y0 = resid_cell_sum - resid_cell_sum.mean()
+    y_norm = float(np.sum(y0**2))
+    if y_norm <= 0:
+        y_norm = 1.0
+    X0 = Xcand - Xcand.mean(axis=0, keepdims=True)
+    num = np.abs(X0.T @ y0)
+    den = np.sqrt(np.sum(X0**2, axis=0) * y_norm)
+    score = np.divide(num, den, out=np.zeros_like(num), where=den > 0)
+
+    score_order = np.argsort(-score)
+    screen_rank = np.empty(len(candidate), dtype=int)
+    screen_rank[score_order] = np.arange(1, len(candidate) + 1)
+    pool_size_use = int(min(selection_pool_size, len(candidate)))
+    pool_idx = score_order[:pool_size_use]
+    pool_set = set(pool_idx.tolist())
+
+    screening_df = pd.DataFrame(
+        {
+            "gene": candidate,
+            "screen_score": score.astype(float),
+            "screen_rank": screen_rank.astype(int),
+            "in_pool": np.array([idx in pool_set for idx in range(len(candidate))], dtype=bool),
+        }
+    ).sort_values("screen_rank", kind="stable").reset_index(drop=True)
+
+    remaining = [candidate[i] for i in pool_idx]
+    selected: list[str] = []
+    path_rows: list[dict[str, Any]] = [
+        {
+            "step": 0,
+            "added_gene": "",
+            "n_genes": 0,
+            "selected_genes": "",
+            "criterion": str(criterion).lower(),
+            "criterion_value": float(current_metric),
+            "metric_improvement": np.nan,
+            "r2": float(base_fit["fit"].rsquared),
+            "adj_r2": float(base_fit["fit"].rsquared_adj),
+            "aic": float(base_fit["fit"].aic),
+            "bic": float(base_fit["fit"].bic),
+        }
+    ]
+
+    for step in range(1, max_genes_use + 1):
+        best_gene: str | None = None
+        best_fit: dict[str, Any] | None = None
+        best_metric: float | None = None
+
+        for gene in remaining:
+            trial_genes = selected + [gene]
+            try:
+                trial_fit = fit_multi_gene_radius_model(
+                    expr_df,
+                    shared,
+                    trial_genes,
+                    cluster_robust=cluster_robust,
+                )
+            except Exception:
+                continue
+
+            trial_metric = _extract_model_metric(trial_fit["fit"], criterion)
+            if best_metric is None:
+                best_gene = gene
+                best_fit = trial_fit
+                best_metric = trial_metric
+                continue
+
+            improved, _ = _metric_improved(
+                trial_metric,
+                best_metric,
+                criterion,
+                min_improvement=0.0,
+            )
+            if improved:
+                best_gene = gene
+                best_fit = trial_fit
+                best_metric = trial_metric
+
+        if best_gene is None or best_fit is None or best_metric is None:
+            break
+
+        improved_vs_current, gain = _metric_improved(
+            best_metric,
+            current_metric,
+            criterion,
+            min_improvement=min_improvement,
+        )
+        if not improved_vs_current:
+            break
+
+        selected.append(best_gene)
+        remaining.remove(best_gene)
+        current_fit = best_fit
+        current_metric = best_metric
+
+        if verbose:
+            print(
+                f"Forward selection step {step}: added {best_gene} "
+                f"({criterion.lower()}={current_metric:.4g}, improvement={gain:.4g})"
+            )
+
+        path_rows.append(
+            {
+                "step": step,
+                "added_gene": best_gene,
+                "n_genes": len(selected),
+                "selected_genes": "|".join(selected),
+                "criterion": str(criterion).lower(),
+                "criterion_value": float(current_metric),
+                "metric_improvement": float(gain),
+                "r2": float(current_fit["fit"].rsquared),
+                "adj_r2": float(current_fit["fit"].rsquared_adj),
+                "aic": float(current_fit["fit"].aic),
+                "bic": float(current_fit["fit"].bic),
+            }
+        )
+
+    if selected:
+        selected_summary_df = summarize_multi_gene_gene_terms(current_fit)
+    else:
+        selected_summary_df = pd.DataFrame(
+            columns=[
+                "gene",
+                "selection_step",
+                "beta_gene",
+                "se_gene",
+                "pval_gene",
+                "t_gene",
+                "r2",
+                "adj_r2",
+                "aic",
+                "bic",
+            ]
+        )
+
+    return {
+        "fit": current_fit,
+        "selected_genes": selected,
+        "criterion": str(criterion).lower(),
+        "forward_path": pd.DataFrame(path_rows),
+        "screening_scores": screening_df,
+        "selected_gene_summary": selected_summary_df,
+        "n_screened_pool": pool_size_use,
+    }
+
+
 def compute_svg_morans_i(
     expr_df: pd.DataFrame,
     coords_df: pd.DataFrame,

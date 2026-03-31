@@ -18,6 +18,7 @@ from .pipeline import (
     fit_all_genes,
     fit_single_gene_radius_model,
     fit_slide_level_cell_type_radius_model,
+    forward_select_gene_set,
     prepare_shared_components,
     preprocess_expression_matrix,
     summarize_model_terms,
@@ -342,11 +343,47 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
 
 
+def _add_multi_gene_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--multi-gene",
+        action="store_true",
+        help=(
+            "Use forward-selection multi-gene regression instead of single-gene-per-fit regression."
+        ),
+    )
+    parser.add_argument(
+        "--multi-gene-max-genes",
+        type=int,
+        default=8,
+        help="Maximum number of genes to select in forward-selection mode.",
+    )
+    parser.add_argument(
+        "--multi-gene-pool-size",
+        type=int,
+        default=50,
+        help="Screened candidate pool size for forward selection (smaller is faster).",
+    )
+    parser.add_argument(
+        "--multi-gene-criterion",
+        type=str,
+        choices=["bic", "aic", "adj_r2"],
+        default="bic",
+        help="Selection criterion for forward selection.",
+    )
+    parser.add_argument(
+        "--multi-gene-min-improvement",
+        type=float,
+        default=0.0,
+        help="Minimum criterion improvement required to accept a forward-selection step.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run full SpatioLD pipeline (including permutation inference)."
     )
     _add_common_pipeline_arguments(parser)
+    _add_multi_gene_arguments(parser)
     parser.add_argument("--n-perm", type=int, default=100, help="Permutation count for p-values and null summaries.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
     parser.add_argument("--alpha", type=float, default=0.05, help="Significance alpha for p-value mask.")
@@ -361,6 +398,7 @@ def build_slim_parser() -> argparse.ArgumentParser:
         )
     )
     _add_common_pipeline_arguments(parser)
+    _add_multi_gene_arguments(parser)
     return parser
 
 
@@ -449,6 +487,7 @@ def build_cluster_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
+    _add_multi_gene_arguments(parser)
     return parser
 
 
@@ -681,12 +720,28 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     hvg_genes = hvg_df.index.astype(str).tolist()
     expr_model = expr_aligned.loc[:, hvg_genes].copy()
 
-    results_df, _ = fit_all_genes(
-        expr_model,
-        shared,
-        cluster_robust=not args.no_cluster_robust,
-        verbose=not args.quiet,
-    )
+    selection_obj: dict[str, object] | None = None
+    if args.multi_gene:
+        if not args.quiet:
+            print("Running forward-selection multi-gene regression.")
+        selection_obj = forward_select_gene_set(
+            expr_model,
+            shared,
+            max_genes=args.multi_gene_max_genes,
+            selection_pool_size=args.multi_gene_pool_size,
+            criterion=args.multi_gene_criterion,
+            min_improvement=args.multi_gene_min_improvement,
+            cluster_robust=not args.no_cluster_robust,
+            verbose=not args.quiet,
+        )
+        results_df = selection_obj["selected_gene_summary"]  # type: ignore[index]
+    else:
+        results_df, _ = fit_all_genes(
+            expr_model,
+            shared,
+            cluster_robust=not args.no_cluster_robust,
+            verbose=not args.quiet,
+        )
     svg_df = obj.compute_svg_morans_i(expr_model, k=args.svg_k)
 
     ld_df.to_csv(output_dir / "local_diversity.csv")
@@ -700,6 +755,9 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     slide_ct_effects_df.to_csv(output_dir / "slide_cell_type_effects.csv", index=False)
     results_df.to_csv(output_dir / "gene_radius_model_results.csv", index=False)
     svg_df.to_csv(output_dir / "svg_morans_i.csv", index=False)
+    if selection_obj is not None:
+        selection_obj["forward_path"].to_csv(output_dir / "multi_gene_forward_selection.csv", index=False)  # type: ignore[index]
+        selection_obj["screening_scores"].to_csv(output_dir / "multi_gene_screening_scores.csv", index=False)  # type: ignore[index]
 
     if (not skip_permutation) and getattr(args, "save_permutation_distribution", False):
         np.savez_compressed(output_dir / "permutation_distribution.npz", permutation_distribution=perm_dist)
@@ -718,6 +776,13 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         "radii": radii,
         "permutation_enabled": not skip_permutation,
         "n_perm": int(args.n_perm) if not skip_permutation else 0,
+        "model_type": "multi_gene_forward_selection" if args.multi_gene else "single_gene",
+        "multi_gene_selected_genes": (
+            selection_obj["selected_genes"] if selection_obj is not None else []  # type: ignore[index]
+        ),
+        "multi_gene_criterion": args.multi_gene_criterion if args.multi_gene else None,
+        "multi_gene_pool_size": int(args.multi_gene_pool_size) if args.multi_gene else None,
+        "multi_gene_max_genes": int(args.multi_gene_max_genes) if args.multi_gene else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
 
@@ -731,6 +796,9 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")
         print(f"Modeled genes: {expr_model.shape[1]}")
+        if args.multi_gene and selection_obj is not None:
+            selected_genes = selection_obj["selected_genes"]  # type: ignore[index]
+            print(f"Selected genes ({len(selected_genes)}): {selected_genes}")
         print(f"Radii: {radii}")
 
 
@@ -773,28 +841,25 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
 
     expr_hvg = expr_aligned.loc[:, hvg_genes].copy()
     coords_df = meta_aligned[[args.x_col, args.y_col]].copy()
-
-    summaries: list[dict[str, float | str | int]] = []
-    cluster_meta_by_gene_df = pd.DataFrame(index=expr_hvg.index.astype(str))
-    n_genes = expr_hvg.shape[1]
-    for k, gene in enumerate(expr_hvg.columns, start=1):
+    selection_obj_cluster: dict[str, object] | None = None
+    if args.multi_gene:
         if not args.quiet:
-            print(f"Leave-one-gene-out fit {k}/{n_genes}: {gene}")
-
-        expr_wo_gene = expr_aligned.copy()
-        expr_wo_gene.drop(columns=[gene], inplace=True)
-
+            print("Running cluster-label multi-gene workflow.")
         if args.cluster_method != "scanpy-leiden":
             raise ValueError(f"Unsupported cluster method: {args.cluster_method}")
+
         cluster_labels = _cluster_cells_scanpy_leiden(
-            expr_wo_gene,
+            expr_aligned,
             random_state=args.random_state,
             n_neighbors=args.cluster_n_neighbors,
             n_pcs=args.cluster_n_pcs,
             resolution=args.cluster_resolution,
             n_clusters=args.cluster_n_clusters,
         )
-        cluster_meta_by_gene_df[str(gene)] = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str)
+        cluster_meta_by_gene_df = pd.DataFrame(
+            {"cluster_label": cluster_labels.reindex(expr_hvg.index).astype(str)},
+            index=expr_hvg.index.astype(str),
+        )
 
         ld_df = compute_local_diversity_multi_radius(
             coords_df.loc[cluster_labels.index],
@@ -820,33 +885,93 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             normalize_by=args.regression_normalize_by,
             normalize_by_global_entropy=not args.no_regression_entropy_normalize,
         )
-        fit_res = fit_single_gene_radius_model(
-            gene_values=expr_hvg.loc[cluster_labels.index, gene].values,
-            shared=shared,
+        expr_model = expr_hvg.loc[cluster_labels.index].copy()
+        selection_obj_cluster = forward_select_gene_set(
+            expr_model,
+            shared,
+            max_genes=args.multi_gene_max_genes,
+            selection_pool_size=args.multi_gene_pool_size,
+            criterion=args.multi_gene_criterion,
+            min_improvement=args.multi_gene_min_improvement,
             cluster_robust=not args.no_cluster_robust,
+            verbose=not args.quiet,
         )
+        results_df = selection_obj_cluster["selected_gene_summary"]  # type: ignore[index]
+        results_df["n_clusters"] = int(cluster_labels.nunique())
+    else:
+        summaries: list[dict[str, float | str | int]] = []
+        cluster_meta_by_gene_df = pd.DataFrame(index=expr_hvg.index.astype(str))
+        n_genes = expr_hvg.shape[1]
+        for k, gene in enumerate(expr_hvg.columns, start=1):
+            if not args.quiet:
+                print(f"Leave-one-gene-out fit {k}/{n_genes}: {gene}")
 
-        coef = fit_res["coef"]
-        se = fit_res["se"]
-        pval = fit_res["pval"]
-        beta_gene = float(coef["gene"])
-        se_gene = float(se["gene"])
-        summaries.append(
-            {
-                "gene": str(gene),
-                "beta_gene": beta_gene,
-                "se_gene": se_gene,
-                "pval_gene": float(pval["gene"]),
-                "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
-                "r2": float(fit_res["fit"].rsquared),
-                "adj_r2": float(fit_res["fit"].rsquared_adj),
-                "aic": float(fit_res["fit"].aic),
-                "bic": float(fit_res["fit"].bic),
-                "n_clusters": int(cluster_labels.nunique()),
-            }
-        )
+            expr_wo_gene = expr_aligned.copy()
+            expr_wo_gene.drop(columns=[gene], inplace=True)
 
-    results_df = pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
+            if args.cluster_method != "scanpy-leiden":
+                raise ValueError(f"Unsupported cluster method: {args.cluster_method}")
+            cluster_labels = _cluster_cells_scanpy_leiden(
+                expr_wo_gene,
+                random_state=args.random_state,
+                n_neighbors=args.cluster_n_neighbors,
+                n_pcs=args.cluster_n_pcs,
+                resolution=args.cluster_resolution,
+                n_clusters=args.cluster_n_clusters,
+            )
+            cluster_meta_by_gene_df[str(gene)] = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str)
+
+            ld_df = compute_local_diversity_multi_radius(
+                coords_df.loc[cluster_labels.index],
+                cluster_labels,
+                radii=radii,
+            )
+            cluster_meta = pd.DataFrame({"cluster_label": cluster_labels})
+            if args.cell_size_col is not None:
+                if args.cell_size_col not in meta_aligned.columns:
+                    raise KeyError(f"`{args.cell_size_col}` not found in aligned metadata.")
+                cluster_meta[args.cell_size_col] = meta_aligned.loc[cluster_labels.index, args.cell_size_col].values
+
+            shared = prepare_shared_components(
+                response_matrix=ld_df.values,
+                metadata_df=cluster_meta,
+                radius_values=radii,
+                cell_type_col="cluster_label",
+                radius_mode=args.radius_mode,
+                poly_degree=args.poly_degree,
+                n_radius_knots=args.n_radius_knots,
+                spline_degree=args.spline_degree,
+                covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
+                normalize_by=args.regression_normalize_by,
+                normalize_by_global_entropy=not args.no_regression_entropy_normalize,
+            )
+            fit_res = fit_single_gene_radius_model(
+                gene_values=expr_hvg.loc[cluster_labels.index, gene].values,
+                shared=shared,
+                cluster_robust=not args.no_cluster_robust,
+            )
+
+            coef = fit_res["coef"]
+            se = fit_res["se"]
+            pval = fit_res["pval"]
+            beta_gene = float(coef["gene"])
+            se_gene = float(se["gene"])
+            summaries.append(
+                {
+                    "gene": str(gene),
+                    "beta_gene": beta_gene,
+                    "se_gene": se_gene,
+                    "pval_gene": float(pval["gene"]),
+                    "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
+                    "r2": float(fit_res["fit"].rsquared),
+                    "adj_r2": float(fit_res["fit"].rsquared_adj),
+                    "aic": float(fit_res["fit"].aic),
+                    "bic": float(fit_res["fit"].bic),
+                    "n_clusters": int(cluster_labels.nunique()),
+                }
+            )
+
+        results_df = pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
     hvg_out = hvg_df.copy()
     hvg_out["gene"] = hvg_out.index.astype(str)
     hvg_out = hvg_out.reset_index(drop=True)
@@ -854,10 +979,17 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
     results_df.to_csv(output_dir / "cluster_gene_ld_model_results.csv", index=False)
     hvg_out.to_csv(output_dir / "hvg_selected.csv", index=False)
     cluster_meta_by_gene_df.to_csv(output_dir / "cluster_meta_by_gene.csv")
+    if selection_obj_cluster is not None:
+        selection_obj_cluster["forward_path"].to_csv(output_dir / "multi_gene_forward_selection.csv", index=False)  # type: ignore[index]
+        selection_obj_cluster["screening_scores"].to_csv(output_dir / "multi_gene_screening_scores.csv", index=False)  # type: ignore[index]
     _write_args_snapshot(args, output_dir, radii, permutation_enabled=False)
 
     summary_payload = {
-        "workflow": "cluster_ld_leave_one_gene_out",
+        "workflow": (
+            "cluster_ld_multi_gene_forward_selection"
+            if args.multi_gene
+            else "cluster_ld_leave_one_gene_out"
+        ),
         "n_cells": int(expr_aligned.shape[0]),
         "n_genes_after_filter": int(expr_aligned.shape[1]),
         "n_top_hvg_requested": int(args.n_top_hvg),
@@ -872,6 +1004,13 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
         "covariate_cols": [args.cell_size_col] if args.cell_size_col is not None else [],
         "n_radii": int(len(radii)),
         "radii": radii,
+        "model_type": "multi_gene_forward_selection" if args.multi_gene else "single_gene",
+        "multi_gene_selected_genes": (
+            selection_obj_cluster["selected_genes"] if selection_obj_cluster is not None else []  # type: ignore[index]
+        ),
+        "multi_gene_criterion": args.multi_gene_criterion if args.multi_gene else None,
+        "multi_gene_pool_size": int(args.multi_gene_pool_size) if args.multi_gene else None,
+        "multi_gene_max_genes": int(args.multi_gene_max_genes) if args.multi_gene else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
 
@@ -883,6 +1022,9 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")
         print(f"HVGs modeled: {expr_hvg.shape[1]}")
+        if args.multi_gene and selection_obj_cluster is not None:
+            selected_genes = selection_obj_cluster["selected_genes"]  # type: ignore[index]
+            print(f"Selected genes ({len(selected_genes)}): {selected_genes}")
         print(f"Radii: {radii}")
 
 

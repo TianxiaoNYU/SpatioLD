@@ -6,7 +6,7 @@ This package includes:
 
 - Fundamental local-diversity computation and permutation inference
 - A unified `SpatioLD` object workflow for downstream analysis
-- Updated gene-radius modeling pipeline (spline/poly basis + per-gene fitting)
+- Updated gene-radius modeling pipeline (spline/poly basis + single-gene or forward-selected multi-gene fitting)
 - Pipeline-level utilities for clustering, summaries, SVG scoring
 - Visualization helpers for key outputs
 
@@ -118,7 +118,8 @@ spatiold-pipeline \
   --metadata /path/to/metadata.csv \
   --expression /path/to/expression.csv \
   --output-dir /path/to/output \
-  --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10
+  --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10 \
+  --multi-gene
 ```
 
 Or run directly from a single AnnData file:
@@ -143,6 +144,8 @@ spatiold-pipeline-slim \
 
 `spatiold-pipeline-slim` skips permutation p-value/null computation, while keeping preprocessing, local diversity, clustering, slide-level modeling, gene-radius modeling, and SVG scoring. Permutation-dependent output files are still written with placeholder values.
 
+Use `--multi-gene` to switch from single-gene fits to forward-selection multi-gene regression.
+
 For metadata without cell-type annotations, run the cluster-label workflow:
 
 ```bash
@@ -155,7 +158,7 @@ spatiold-cluster \
   --cluster-n-clusters 8
 ```
 
-`spatiold-cluster` uses top HVGs, then for each gene performs leave-one-gene-out clustering (default `scanpy-leiden`) to generate cluster labels, computes LD from those labels, and fits the single-gene LD association model. Main outputs:
+`spatiold-cluster` uses top HVGs, then by default performs leave-one-gene-out clustering with single-gene LD association fits. With `--multi-gene`, it clusters once and runs forward-selection multi-gene regression on HVGs. Main outputs:
 
 - `cluster_gene_ld_model_results.csv`
 - `hvg_selected.csv`
@@ -194,6 +197,7 @@ Common optional inputs (dataset-dependent):
 - `--n-perm`, `--n-model-genes` for runtime control
 - `--regression-normalize-by` or `--no-regression-entropy-normalize` to control
   response normalization in gene-radius regression
+- `--multi-gene` (plus `--multi-gene-max-genes`, `--multi-gene-pool-size`, `--multi-gene-criterion`) for forward-selection multi-gene modeling
 
 CLI now also writes slide-level cell-type model outputs:
 

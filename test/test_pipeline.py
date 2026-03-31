@@ -12,8 +12,11 @@ from spatiold import (
     compute_sample_vs_null_summary,
     compute_svg_morans_i,
     fit_slide_level_cell_type_radius_model,
+    fit_multi_gene_radius_model,
     fit_single_gene_radius_model,
+    forward_select_gene_set,
     prepare_shared_components,
+    summarize_multi_gene_gene_terms,
     summarize_model_terms,
     summarize_slide_level_cell_type_effects,
     summarize_local_diversity_by_cell_type,
@@ -164,3 +167,49 @@ def test_slide_level_cell_type_radius_model() -> None:
         effects_df.columns
     )
     assert shared["reference_cell_type"] in effects_df["cell_type"].values
+
+
+def test_multi_gene_forward_selection_and_fit() -> None:
+    pytest.importorskip("statsmodels")
+
+    coords, labels, meta = _make_small_dataset()
+    ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30, 40])
+
+    rng = np.random.default_rng(17)
+    target = ld.mean(axis=1).to_numpy(dtype=float)
+    expr = pd.DataFrame(
+        rng.normal(size=(ld.shape[0], 8)),
+        index=ld.index,
+        columns=[f"g{i}" for i in range(8)],
+    )
+    expr["g0"] = target + rng.normal(scale=0.05, size=ld.shape[0])
+    expr["g1"] = 0.5 * target + rng.normal(scale=0.1, size=ld.shape[0])
+
+    shared = prepare_shared_components(
+        response_matrix=ld.values,
+        metadata_df=meta.loc[ld.index],
+        radius_values=[10, 20, 30, 40],
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=2,
+    )
+
+    selected = forward_select_gene_set(
+        expr,
+        shared,
+        max_genes=3,
+        selection_pool_size=6,
+        criterion="bic",
+        verbose=False,
+    )
+    assert {"fit", "selected_genes", "forward_path", "screening_scores", "selected_gene_summary"}.issubset(
+        selected.keys()
+    )
+    assert selected["forward_path"].shape[0] >= 1
+
+    selected_genes = selected["selected_genes"]
+    if len(selected_genes) > 0:
+        fit = fit_multi_gene_radius_model(expr, shared, selected_genes)
+        terms = summarize_multi_gene_gene_terms(fit)
+        assert terms.shape[0] == len(selected_genes)
+        assert {"gene", "beta_gene", "se_gene", "pval_gene", "t_gene"}.issubset(terms.columns)
