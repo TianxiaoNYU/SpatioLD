@@ -163,6 +163,21 @@ spatiold-cluster \
 - `run_config.json`
 - `run_summary.json`
 
+For a faster variant, add `--simplify`:
+
+```bash
+spatiold-cluster \
+  --metadata /path/to/metadata_xy_only.csv \
+  --expression /path/to/expression.csv \
+  --output-dir /path/to/output \
+  --radii 30 60 90 120 \
+  --n-top-hvg 100 \
+  --cluster-n-clusters 8 \
+  --simplify
+```
+
+In simplify mode, clustering runs once on the full filtered expression matrix, and the resulting labels are reused for all per-gene downstream modeling steps. Output file names remain the same.
+
 Clustering controls:
 
 - `--cluster-n-clusters` directly sets cluster count and takes priority over `--cluster-resolution`.
