@@ -414,8 +414,21 @@ def build_cluster_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--min-fraction-expressed", type=float, default=0.02, help="Gene filter: minimum fraction of cells with nonzero expression.")
     parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
-    parser.add_argument("--n-top-hvg", type=int, default=100, help="Top HVGs used for leave-one-gene-out modeling.")
+    parser.add_argument(
+        "--n-top-hvg",
+        type=int,
+        default=100,
+        help="Top HVGs used for cluster-label gene modeling.",
+    )
     parser.add_argument("--hvg-flavor", type=str, default="seurat", help="Scanpy HVG flavor (default: seurat).")
+    parser.add_argument(
+        "--simplify",
+        action="store_true",
+        help=(
+            "Skip leave-one-gene-out clustering. Cluster once using the full filtered expression matrix "
+            "and reuse those labels for all downstream per-gene modeling."
+        ),
+    )
 
     parser.add_argument("--cluster-method", type=str, choices=["scanpy-leiden"], default="scanpy-leiden", help="Clustering backend (default: scanpy-leiden).")
     parser.add_argument(
@@ -764,7 +777,9 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
     if expr_aligned.empty or meta_aligned.empty:
         raise ValueError("No overlapping cells found between metadata and expression after filtering/alignment.")
 
-    n_top_hvg = int(max(2, min(args.n_top_hvg, expr_aligned.shape[1])))
+    simplify = bool(getattr(args, "simplify", False))
+    min_hvg_target = 1 if simplify else 2
+    n_top_hvg = int(max(min_hvg_target, min(args.n_top_hvg, expr_aligned.shape[1])))
     hvg_df = _select_hvg_with_fallback(
         expr_aligned,
         n_top_hvg=n_top_hvg,
@@ -772,34 +787,20 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
         quiet=args.quiet,
     )
     hvg_genes = hvg_df.index.astype(str).tolist()
-    if len(hvg_genes) < 2:
-        raise ValueError("Need at least 2 HVGs for leave-one-gene-out clustering.")
+    min_hvg_required = 1 if simplify else 2
+    if len(hvg_genes) < min_hvg_required:
+        mode_msg = "simplified clustering" if simplify else "leave-one-gene-out clustering"
+        raise ValueError(f"Need at least {min_hvg_required} HVG(s) for {mode_msg}.")
 
     expr_hvg = expr_aligned.loc[:, hvg_genes].copy()
     coords_df = meta_aligned[[args.x_col, args.y_col]].copy()
 
     summaries: list[dict[str, float | str | int]] = []
     cluster_meta_by_gene_df = pd.DataFrame(index=expr_hvg.index.astype(str))
-    n_genes = expr_hvg.shape[1]
-    for k, gene in enumerate(expr_hvg.columns, start=1):
-        if not args.quiet:
-            print(f"Leave-one-gene-out fit {k}/{n_genes}: {gene}")
+    if args.cluster_method != "scanpy-leiden":
+        raise ValueError(f"Unsupported cluster method: {args.cluster_method}")
 
-        expr_wo_gene = expr_aligned.copy()
-        expr_wo_gene.drop(columns=[gene], inplace=True)
-
-        if args.cluster_method != "scanpy-leiden":
-            raise ValueError(f"Unsupported cluster method: {args.cluster_method}")
-        cluster_labels = _cluster_cells_scanpy_leiden(
-            expr_wo_gene,
-            random_state=args.random_state,
-            n_neighbors=args.cluster_n_neighbors,
-            n_pcs=args.cluster_n_pcs,
-            resolution=args.cluster_resolution,
-            n_clusters=args.cluster_n_clusters,
-        )
-        cluster_meta_by_gene_df[str(gene)] = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str)
-
+    def _build_shared_from_cluster_labels(cluster_labels: pd.Series) -> dict[str, object]:
         ld_df = compute_local_diversity_multi_radius(
             coords_df.loc[cluster_labels.index],
             cluster_labels,
@@ -811,7 +812,7 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
                 raise KeyError(f"`{args.cell_size_col}` not found in aligned metadata.")
             cluster_meta[args.cell_size_col] = meta_aligned.loc[cluster_labels.index, args.cell_size_col].values
 
-        shared = prepare_shared_components(
+        return prepare_shared_components(
             response_matrix=ld_df.values,
             metadata_df=cluster_meta,
             radius_values=radii,
@@ -824,33 +825,84 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             normalize_by=args.regression_normalize_by,
             normalize_by_global_entropy=not args.no_regression_entropy_normalize,
         )
-        fit_res = fit_single_gene_radius_model(
-            gene_values=expr_hvg.loc[cluster_labels.index, gene].values,
-            shared=shared,
+
+    if simplify:
+        if not args.quiet:
+            print(
+                "Simplify mode enabled: clustering once on the full filtered expression matrix "
+                "and reusing labels for all modeled genes."
+            )
+
+        cluster_labels = _cluster_cells_scanpy_leiden(
+            expr_aligned,
+            random_state=args.random_state,
+            n_neighbors=args.cluster_n_neighbors,
+            n_pcs=args.cluster_n_pcs,
+            resolution=args.cluster_resolution,
+            n_clusters=args.cluster_n_clusters,
+        )
+        shared = _build_shared_from_cluster_labels(cluster_labels)
+        expr_model = expr_hvg.loc[cluster_labels.index].copy()
+        results_df, _ = fit_all_genes(
+            expr_model,
+            shared,
             cluster_robust=not args.no_cluster_robust,
+            verbose=not args.quiet,
         )
+        results_df["n_clusters"] = int(cluster_labels.nunique())
 
-        coef = fit_res["coef"]
-        se = fit_res["se"]
-        pval = fit_res["pval"]
-        beta_gene = float(coef["gene"])
-        se_gene = float(se["gene"])
-        summaries.append(
-            {
-                "gene": str(gene),
-                "beta_gene": beta_gene,
-                "se_gene": se_gene,
-                "pval_gene": float(pval["gene"]),
-                "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
-                "r2": float(fit_res["fit"].rsquared),
-                "adj_r2": float(fit_res["fit"].rsquared_adj),
-                "aic": float(fit_res["fit"].aic),
-                "bic": float(fit_res["fit"].bic),
-                "n_clusters": int(cluster_labels.nunique()),
-            }
+        labels_for_cells = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str).to_numpy()
+        labels_matrix = np.tile(labels_for_cells.reshape(-1, 1), (1, expr_hvg.shape[1]))
+        cluster_meta_by_gene_df = pd.DataFrame(
+            labels_matrix,
+            index=cluster_meta_by_gene_df.index,
+            columns=expr_hvg.columns.astype(str),
         )
+    else:
+        n_genes = expr_hvg.shape[1]
+        for k, gene in enumerate(expr_hvg.columns, start=1):
+            if not args.quiet:
+                print(f"Leave-one-gene-out fit {k}/{n_genes}: {gene}")
 
-    results_df = pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
+            expr_wo_gene = expr_aligned.drop(columns=[gene]).copy()
+            cluster_labels = _cluster_cells_scanpy_leiden(
+                expr_wo_gene,
+                random_state=args.random_state,
+                n_neighbors=args.cluster_n_neighbors,
+                n_pcs=args.cluster_n_pcs,
+                resolution=args.cluster_resolution,
+                n_clusters=args.cluster_n_clusters,
+            )
+            cluster_meta_by_gene_df[str(gene)] = cluster_labels.reindex(cluster_meta_by_gene_df.index).astype(str)
+
+            shared = _build_shared_from_cluster_labels(cluster_labels)
+            fit_res = fit_single_gene_radius_model(
+                gene_values=expr_hvg.loc[cluster_labels.index, gene].values,
+                shared=shared,
+                cluster_robust=not args.no_cluster_robust,
+            )
+
+            coef = fit_res["coef"]
+            se = fit_res["se"]
+            pval = fit_res["pval"]
+            beta_gene = float(coef["gene"])
+            se_gene = float(se["gene"])
+            summaries.append(
+                {
+                    "gene": str(gene),
+                    "beta_gene": beta_gene,
+                    "se_gene": se_gene,
+                    "pval_gene": float(pval["gene"]),
+                    "t_gene": beta_gene / se_gene if se_gene != 0 else np.nan,
+                    "r2": float(fit_res["fit"].rsquared),
+                    "adj_r2": float(fit_res["fit"].rsquared_adj),
+                    "aic": float(fit_res["fit"].aic),
+                    "bic": float(fit_res["fit"].bic),
+                    "n_clusters": int(cluster_labels.nunique()),
+                }
+            )
+
+        results_df = pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
     hvg_out = hvg_df.copy()
     hvg_out["gene"] = hvg_out.index.astype(str)
     hvg_out = hvg_out.reset_index(drop=True)
@@ -861,11 +913,13 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
     _write_args_snapshot(args, output_dir, radii, permutation_enabled=False)
 
     summary_payload = {
-        "workflow": "cluster_ld_leave_one_gene_out",
+        "workflow": "cluster_ld_simplified_single_clustering" if simplify else "cluster_ld_leave_one_gene_out",
+        "simplify": simplify,
         "n_cells": int(expr_aligned.shape[0]),
         "n_genes_after_filter": int(expr_aligned.shape[1]),
         "n_top_hvg_requested": int(args.n_top_hvg),
         "n_hvg_used": int(expr_hvg.shape[1]),
+        "clustering_runs": 1 if simplify else int(expr_hvg.shape[1]),
         "cluster_method": str(args.cluster_method),
         "cluster_n_clusters": (
             int(args.cluster_n_clusters) if args.cluster_n_clusters is not None else None
@@ -881,6 +935,8 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
 
     if not args.quiet:
         print("SpatioLD cluster-label workflow complete.")
+        mode = "simplify (single clustering)" if simplify else "leave-one-gene-out"
+        print(f"Mode: {mode}")
         print(f"Metadata: {metadata_source}")
         print(f"Expression: {expression_source}")
         print(f"Output dir: {output_dir}")
