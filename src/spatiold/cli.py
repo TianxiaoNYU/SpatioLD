@@ -605,6 +605,9 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     if args.y_col != "y":
         rename_cols[args.y_col] = "y"
     if args.cell_type_col != "cell_type":
+        # check if "cell_type" is present before trying to rename to avoid accidental overwriting; if so, drop the old "cell_type" to avoid confusion
+        if "cell_type" in meta_obj.columns:
+            meta_obj = meta_obj.drop(columns=["cell_type"])
         rename_cols[args.cell_type_col] = "cell_type"
     if rename_cols:
         meta_obj = meta_obj.rename(columns=rename_cols)
@@ -645,6 +648,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
             store=True,
             pvals_key=pval_key,
             perm_mean_key=perm_mean_key,
+            alternative="two-sided",
         )
         pvals_df = perm_stats["pvals"]
         perm_mean_df = perm_stats["perm_mean"]
