@@ -11,6 +11,7 @@ from spatiold import (
     compute_nd_permutation_distribution,
     compute_sample_vs_null_summary,
     compute_svg_morans_i,
+    fit_all_genes,
     fit_slide_level_cell_type_radius_model,
     fit_single_gene_radius_model,
     prepare_shared_components,
@@ -89,6 +90,39 @@ def test_gene_radius_model_and_svg() -> None:
     svg_df = compute_svg_morans_i(expr, coords)
     assert list(svg_df.columns) == ["gene", "moran_I"]
     assert svg_df.shape[0] == expr.shape[1]
+
+
+def test_fit_all_genes_can_skip_retaining_full_fit_objects() -> None:
+    pytest.importorskip("statsmodels")
+
+    coords, labels, meta = _make_small_dataset()
+    ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30])
+
+    rng = np.random.default_rng(11)
+    expr = pd.DataFrame(
+        rng.normal(size=(ld.shape[0], 4)),
+        index=ld.index,
+        columns=[f"g{i}" for i in range(4)],
+    )
+
+    shared = prepare_shared_components(
+        response_matrix=ld.values,
+        metadata_df=meta.loc[ld.index],
+        radius_values=[10, 20, 30],
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=2,
+    )
+
+    results_df, fit_objects = fit_all_genes(
+        expr,
+        shared,
+        verbose=False,
+        store_fit_objects=False,
+    )
+
+    assert results_df.shape[0] == expr.shape[1]
+    assert fit_objects == {}
 
 
 def test_prepare_shared_components_entropy_normalization_controls() -> None:

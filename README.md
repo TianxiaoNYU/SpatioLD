@@ -51,8 +51,14 @@ coords = pd.DataFrame({"x": [0, 0, 1, 1], "y": [0, 1, 0, 1]})
 labels = pd.Series(["A", "A", "B", "B"], index=["c1", "c2", "c3", "c4"])
 
 ld_df = sld.compute_local_diversity_multi_radius(coords, labels, radii=[0.1, 2.0])
-pval_df = sld.compute_nd_permutation_pvals(coords, labels, n_perm=200, radii=[2.0])
-perm_dist = sld.compute_nd_permutation_distribution(coords, labels, n_perm=200, radii=[2.0])
+pval_df = sld.compute_nd_permutation_pvals(
+    coords,
+    labels,
+    n_perm=10,
+    radii=[2.0],
+    pval_pooling="neighborhood_size",
+)
+perm_dist = sld.compute_nd_permutation_distribution(coords, labels, n_perm=10, radii=[2.0])
 ```
 
 ### 2) SpatioLD Object Workflow
@@ -75,8 +81,9 @@ import spatiold as sld
 # assume obj = SpatioLD.from_arrays(...) or SpatioLD.from_anndata(...)
 ld_df = obj.compute_local_diversity(radii=[30, 60, 90], key="ld_full")
 perm_stats = obj.compute_permutation_stats(
-    n_perm=100,
+    n_perm=10,
     radii=[30, 60, 90],
+    pval_pooling="neighborhood_size",
     pvals_key="ld_pvals",
     perm_mean_key="ld_perm_mean",
 )
@@ -99,6 +106,8 @@ shared = obj.prepare_shared_components(
     normalize_by_global_entropy=True,
 )
 results_df, fit_objects = sld.fit_all_genes(expr_df, shared)
+# For large slides, avoid retaining every statsmodels fit in memory:
+results_df_only, _ = sld.fit_all_genes(expr_df, shared, store_fit_objects=False)
 
 # slide-level cell-type model (fit once per slide)
 ct_fit = sld.fit_slide_level_cell_type_radius_model(shared)
@@ -118,7 +127,10 @@ spatiold-pipeline \
   --metadata /path/to/metadata.csv \
   --expression /path/to/expression.csv \
   --output-dir /path/to/output \
-  --radii 30 60 90 120 150 180 210 240 270 --n-perm 10 --min-genes-per-cell 10
+  --radii 30 60 90 120 150 180 210 240 270 \
+  --n-perm 10 \
+  --pval-pooling neighborhood-size \
+  --min-genes-per-cell 10
 ```
 
 Or run directly from a single AnnData file:
@@ -142,6 +154,11 @@ spatiold-pipeline-slim \
 ```
 
 `spatiold-pipeline-slim` skips permutation p-value/null computation, while keeping preprocessing, local diversity, clustering, slide-level modeling, gene-radius modeling, and SVG scoring. Permutation-dependent output files are still written with placeholder values.
+
+Permutation p-values now default to pooling null draws across cells with the
+same neighborhood size at each radius. This keeps the CSR null aligned with
+the local neighborhood size while allowing much smaller `n_perm` values than
+the legacy per-cell-only comparison.
 
 For metadata without cell-type annotations, run the cluster-label workflow:
 

@@ -32,10 +32,11 @@ print("Local diversity:")
 print(ld_df.round(3))
 
 perm_stats = obj.compute_permutation_stats(
-    n_perm=100,
+    n_perm=8,
     radii=[1.2],
     random_state=11,
     n_jobs=1,
+    pval_pooling="neighborhood_size",
     pvals_key="ld_pvals_demo",
     perm_mean_key="ld_perm_mean_demo",
 )
@@ -48,6 +49,7 @@ print(pval_df.round(3))
 print("\nPermutation null mean:")
 print(perm_mean_df.round(3))
 print(f"\nPermutation distribution shape: {perm_dist.shape}")
+print("\nP-value pooling: neighborhood_size")
 
 # Recover stored matrix from adata.obsm through SpatioLD helper
 reloaded = obj.get_result("ld_demo")

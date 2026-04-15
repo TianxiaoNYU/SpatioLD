@@ -47,6 +47,7 @@ def test_from_anndata_with_obs_coordinates() -> None:
         n_perm=10,
         radii=[1.0],
         n_jobs=1,
+        pval_pooling="neighborhood_size",
         key="pvals_test",
     )
 
@@ -92,6 +93,7 @@ def test_object_wrappers_for_downstream_pipeline() -> None:
         n_perm=8,
         radii=radii,
         n_jobs=1,
+        pval_pooling="neighborhood_size",
         pvals_key="pvals_full",
         perm_mean_key="perm_mean_full",
     )

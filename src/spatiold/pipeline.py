@@ -370,6 +370,7 @@ def fit_single_gene_radius_model(
     *,
     add_intercept: bool = True,
     cluster_robust: bool = True,
+    return_fit_object: bool = True,
 ) -> dict[str, Any]:
     """Fit one-gene model from the SlideTag pipeline.
 
@@ -415,13 +416,19 @@ def fit_single_gene_radius_model(
     se = pd.Series(fit_res.bse, index=feature_names)
     pval = pd.Series(fit_res.pvalues, index=feature_names)
 
-    return {
-        "fit": fit_res,
+    result = {
         "coef": coef,
         "se": se,
         "pval": pval,
         "feature_names": feature_names,
+        "rsquared": float(fit_res.rsquared),
+        "rsquared_adj": float(fit_res.rsquared_adj),
+        "aic": float(fit_res.aic),
+        "bic": float(fit_res.bic),
     }
+    if return_fit_object:
+        result["fit"] = fit_res
+    return result
 
 
 def fit_slide_level_cell_type_radius_model(
@@ -572,8 +579,15 @@ def fit_all_genes(
     *,
     cluster_robust: bool = True,
     verbose: bool = True,
+    store_fit_objects: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    """Fit all genes one by one and return summary table + full fit objects."""
+    """Fit all genes one by one and return summary table + optional full fit objects.
+
+    Keeping full fit objects is convenient for downstream inspection, but on
+    large slides it can consume a lot of memory because each statsmodels fit
+    retains the dense long-form design matrix. Set ``store_fit_objects=False``
+    for memory-efficient bulk fitting.
+    """
     if len(expr_df) != shared["n_cells"]:
         raise ValueError("`expr_df` must align with response matrix cell order.")
 
@@ -591,8 +605,10 @@ def fit_all_genes(
             gene_values=expr_df[gene].values,  # type: ignore
             shared=shared,
             cluster_robust=cluster_robust,
+            return_fit_object=store_fit_objects,
         )
-        fit_objects[str(gene)] = fit_res
+        if store_fit_objects:
+            fit_objects[str(gene)] = fit_res
 
         coef = fit_res["coef"]
         se = fit_res["se"]
@@ -608,10 +624,10 @@ def fit_all_genes(
                 "se_gene": gene_se,
                 "pval_gene": float(pval["gene"]),
                 "t_gene": gene_coef / gene_se if gene_se != 0 else np.nan,
-                "r2": float(fit_res["fit"].rsquared),
-                "adj_r2": float(fit_res["fit"].rsquared_adj),
-                "aic": float(fit_res["fit"].aic),
-                "bic": float(fit_res["fit"].bic),
+                "r2": float(fit_res["rsquared"]),
+                "adj_r2": float(fit_res["rsquared_adj"]),
+                "aic": float(fit_res["aic"]),
+                "bic": float(fit_res["bic"]),
             }
         )
 

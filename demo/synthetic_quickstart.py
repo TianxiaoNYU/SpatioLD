@@ -27,10 +27,11 @@ print(ld_df.round(3))
 perm_stats = sld.compute_nd_permutation_stats(
     coords,
     labels,
-    n_perm=100,
+    n_perm=8,
     radii=radii,
     random_state=7,
     n_jobs=1,
+    pval_pooling="neighborhood_size",
 )
 pval_df = perm_stats["pvals"]
 perm_mean_df = perm_stats["perm_mean"]
@@ -42,6 +43,7 @@ print(pval_df.round(3))
 print("\nPermutation null mean:")
 print(perm_mean_df.round(3))
 print(f"\nPermutation distribution shape: {perm_dist.shape}")
+print("\nP-value pooling: neighborhood_size")
 
 # Single-radius API
 single_r = 1.1

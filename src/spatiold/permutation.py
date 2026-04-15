@@ -17,6 +17,17 @@ from .diversity import (
 _NEIGHBORS_G: list[list[list[int]]] | None = None
 _LABELS_G: np.ndarray | None = None
 _BASE_G: float = 2.0
+_PVAL_POOLING_ALIASES: dict[str, str] = {
+    "cell": "cell",
+    "self": "cell",
+    "global": "global",
+    "all": "global",
+    "neighborhood_size": "neighborhood_size",
+    "neighborhood-size": "neighborhood_size",
+    "neighbor_count": "neighborhood_size",
+    "neighbor-count": "neighborhood_size",
+    "matched": "neighborhood_size",
+}
 
 
 def _init_perm_worker(
@@ -90,6 +101,109 @@ def _resolve_cell_ids(
     return pd.Index(np.arange(n_cells).astype(str))
 
 
+def _resolve_pval_pooling(pval_pooling: str) -> str:
+    mode = pval_pooling.strip().lower().replace(" ", "_")
+    try:
+        return _PVAL_POOLING_ALIASES[mode]
+    except KeyError as exc:
+        raise ValueError(
+            "`pval_pooling` must be one of {'cell', 'global', 'neighborhood_size'}."
+        ) from exc
+
+
+def _build_neighbor_count_groups(
+    neighbors_by_radius: list[list[list[int]]],
+) -> list[dict[int, np.ndarray]]:
+    groups_by_radius: list[dict[int, np.ndarray]] = []
+    for neighbors in neighbors_by_radius:
+        counts = np.fromiter((len(nbr_idx) for nbr_idx in neighbors), dtype=np.int64, count=len(neighbors))
+        groups = {
+            int(count): np.flatnonzero(counts == count)
+            for count in np.unique(counts)
+        }
+        groups_by_radius.append(groups)
+    return groups_by_radius
+
+
+def _build_pval_denominator(
+    *,
+    n_perm: int,
+    n_radii: int,
+    n_cells: int,
+    pval_pooling: str,
+    groups_by_radius: list[dict[int, np.ndarray]] | None,
+) -> np.ndarray:
+    if pval_pooling == "cell":
+        return np.full((n_radii, n_cells), n_perm, dtype=np.int64)
+    if pval_pooling == "global":
+        return np.full((n_radii, n_cells), n_perm * n_cells, dtype=np.int64)
+    if groups_by_radius is None:
+        raise RuntimeError("Missing neighborhood-size groups for pooled p-value computation.")
+
+    denominator = np.zeros((n_radii, n_cells), dtype=np.int64)
+    for ridx, groups in enumerate(groups_by_radius):
+        for idx in groups.values():
+            denominator[ridx, idx] = n_perm * idx.size
+    return denominator
+
+
+def _update_cellwise_extremes(
+    *,
+    greater_counts: np.ndarray,
+    less_counts: np.ndarray,
+    observed: np.ndarray,
+    perm_matrix: np.ndarray,
+) -> None:
+    greater_counts += perm_matrix >= observed
+    less_counts += perm_matrix <= observed
+
+
+def _update_global_pooled_extremes(
+    *,
+    greater_counts: np.ndarray,
+    less_counts: np.ndarray,
+    observed: np.ndarray,
+    perm_matrix: np.ndarray,
+) -> None:
+    for ridx in range(perm_matrix.shape[0]):
+        perm_sorted = np.sort(perm_matrix[ridx])
+        greater_counts[ridx] += perm_sorted.size - np.searchsorted(
+            perm_sorted,
+            observed[ridx],
+            side="left",
+        )
+        less_counts[ridx] += np.searchsorted(
+            perm_sorted,
+            observed[ridx],
+            side="right",
+        )
+
+
+def _update_neighbor_count_pooled_extremes(
+    *,
+    greater_counts: np.ndarray,
+    less_counts: np.ndarray,
+    observed: np.ndarray,
+    perm_matrix: np.ndarray,
+    groups_by_radius: list[dict[int, np.ndarray]],
+) -> None:
+    for ridx, groups in enumerate(groups_by_radius):
+        perm_row = perm_matrix[ridx]
+        obs_row = observed[ridx]
+        for idx in groups.values():
+            perm_sorted = np.sort(perm_row[idx])
+            greater_counts[ridx, idx] += perm_sorted.size - np.searchsorted(
+                perm_sorted,
+                obs_row[idx],
+                side="left",
+            )
+            less_counts[ridx, idx] += np.searchsorted(
+                perm_sorted,
+                obs_row[idx],
+                side="right",
+            )
+
+
 def _compute_nd_permutation_outputs(
     xy: pd.DataFrame | np.ndarray | Sequence[Sequence[float]],
     labels: pd.Series | np.ndarray | Sequence[object],
@@ -101,6 +215,7 @@ def _compute_nd_permutation_outputs(
     include_self: bool = True,
     base: float = 2.0,
     alternative: str = "greater",
+    pval_pooling: str = "neighborhood_size",
     need_pvals: bool,
     need_mean: bool,
     need_distribution: bool,
@@ -123,6 +238,8 @@ def _compute_nd_permutation_outputs(
     observed = None
     greater_counts = None
     less_counts = None
+    groups_by_radius = None
+    pval_denominator = None
     if need_pvals:
         observed = compute_local_diversity_from_neighbors(
             labels_arr, neighbors_by_radius, base=base
@@ -130,10 +247,21 @@ def _compute_nd_permutation_outputs(
         alt = alternative.lower()
         if alt not in {"greater", "less", "two-sided"}:
             raise ValueError("`alternative` must be one of {'greater', 'less', 'two-sided' }.")
+        pval_pooling_mode = _resolve_pval_pooling(pval_pooling)
+        if pval_pooling_mode == "neighborhood_size":
+            groups_by_radius = _build_neighbor_count_groups(neighbors_by_radius)
         greater_counts = np.zeros_like(observed, dtype=np.int64)
         less_counts = np.zeros_like(observed, dtype=np.int64)
+        pval_denominator = _build_pval_denominator(
+            n_perm=n_perm,
+            n_radii=n_radii,
+            n_cells=n_cells,
+            pval_pooling=pval_pooling_mode,
+            groups_by_radius=groups_by_radius,
+        )
     else:
         alt = "greater"
+        pval_pooling_mode = "cell"
 
     perm_sum = np.zeros((n_radii, n_cells), dtype=float) if need_mean else None
     perm_dist = np.empty((n_perm, n_radii, n_cells), dtype=float) if need_distribution else None
@@ -153,13 +281,40 @@ def _compute_nd_permutation_outputs(
         if perm_sum is not None:
             perm_sum += perm_matrix
         if observed is not None and greater_counts is not None and less_counts is not None:
-            greater_counts += perm_matrix >= observed
-            less_counts += perm_matrix <= observed
+            if pval_pooling_mode == "cell":
+                _update_cellwise_extremes(
+                    greater_counts=greater_counts,
+                    less_counts=less_counts,
+                    observed=observed,
+                    perm_matrix=perm_matrix,
+                )
+            elif pval_pooling_mode == "global":
+                _update_global_pooled_extremes(
+                    greater_counts=greater_counts,
+                    less_counts=less_counts,
+                    observed=observed,
+                    perm_matrix=perm_matrix,
+                )
+            else:
+                if groups_by_radius is None:
+                    raise RuntimeError("Missing neighborhood-size groups for pooled p-values.")
+                _update_neighbor_count_pooled_extremes(
+                    greater_counts=greater_counts,
+                    less_counts=less_counts,
+                    observed=observed,
+                    perm_matrix=perm_matrix,
+                    groups_by_radius=groups_by_radius,
+                )
 
     pvals_df = None
-    if observed is not None and greater_counts is not None and less_counts is not None:
-        p_greater = (greater_counts + 1) / (n_perm + 1)
-        p_less = (less_counts + 1) / (n_perm + 1)
+    if (
+        observed is not None
+        and greater_counts is not None
+        and less_counts is not None
+        and pval_denominator is not None
+    ):
+        p_greater = (greater_counts + 1) / (pval_denominator + 1)
+        p_less = (less_counts + 1) / (pval_denominator + 1)
 
         if alt == "greater":
             pvals = p_greater
@@ -187,8 +342,19 @@ def compute_nd_permutation_stats(
     include_self: bool = True,
     base: float = 2.0,
     alternative: str = "greater",
+    pval_pooling: str = "neighborhood_size",
 ) -> dict[str, pd.DataFrame | np.ndarray]:
     """Compute permutation p-values, null mean, and distribution in one pass.
+
+    Parameters
+    ----------
+    pval_pooling
+        Strategy for pooling permutation-null draws when computing cell-level
+        p-values. ``"cell"`` reproduces the legacy per-cell comparison,
+        ``"global"`` pools across all permuted cells at a radius, and
+        ``"neighborhood_size"`` pools across permuted cells with the same
+        neighborhood size at that radius. The latter is the default because
+        the CSR null depends on neighborhood size, not cell identity.
 
     Returns
     -------
@@ -208,6 +374,7 @@ def compute_nd_permutation_stats(
         include_self=include_self,
         base=base,
         alternative=alternative,
+        pval_pooling=pval_pooling,
         need_pvals=True,
         need_mean=True,
         need_distribution=True,
@@ -232,6 +399,7 @@ def compute_nd_permutation_pvals(
     include_self: bool = True,
     base: float = 2.0,
     alternative: str = "greater",
+    pval_pooling: str = "neighborhood_size",
 ) -> pd.DataFrame:
     """Compute permutation p-values for neighborhood diversity.
 
@@ -245,6 +413,11 @@ def compute_nd_permutation_pvals(
         Number of label permutations.
     alternative
         One of ``{"greater", "less", "two-sided"}``.
+    pval_pooling
+        Strategy for pooling permutation-null draws when computing p-values.
+        ``"neighborhood_size"`` is the default and compares each observed cell
+        to all permuted cells with the same neighborhood size at the same
+        radius.
     """
     pvals_df, _, _ = _compute_nd_permutation_outputs(
         xy,
@@ -256,6 +429,7 @@ def compute_nd_permutation_pvals(
         include_self=include_self,
         base=base,
         alternative=alternative,
+        pval_pooling=pval_pooling,
         need_pvals=True,
         need_mean=False,
         need_distribution=False,

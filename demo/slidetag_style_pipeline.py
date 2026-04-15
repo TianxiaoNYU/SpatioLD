@@ -74,7 +74,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-cells", type=int, default=2500, help="Subsample metadata to this many cells for runtime control.")
     parser.add_argument("--n-genes", type=int, default=1000, help="Number of synthetic expression genes to generate.")
     parser.add_argument("--n-model-genes", type=int, default=1000, help="Number of genes used in regression/SVG steps.")
-    parser.add_argument("--n-perm", type=int, default=50, help="Permutations for p-values and null distribution.")
+    parser.add_argument("--n-perm", type=int, default=10, help="Permutations for p-values and null distribution.")
+    parser.add_argument(
+        "--pval-pooling",
+        type=str,
+        choices=["cell", "global", "neighborhood-size"],
+        default="neighborhood-size",
+        help="How to pool permutation-null draws for p-values.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--plot", action="store_true", help="Generate plots (off by default).")
     return parser.parse_args()
@@ -116,6 +123,7 @@ def main() -> None:
         radii=radii,
         random_state=args.seed,
         n_jobs=1,
+        pval_pooling=args.pval_pooling,
         pvals_key="ld_pvals",
         perm_mean_key="ld_perm_mean",
     )
@@ -195,6 +203,7 @@ def main() -> None:
     print(f"Cells used: {len(meta)}")
     print(f"Synthetic expression shape: {expr_df.shape} (modeled genes: {n_model_genes})")
     print(f"Global Shannon entropy: {entropy_global:.4f}")
+    print(f"P-value pooling: {args.pval_pooling}")
     print(f"LD matrix shape: {ld_df.shape}")
     print(f"Regression summary rows: {results_df.shape[0]}")
     print(f"Top 5 genes by p-value: {results_df.head(5)['gene'].tolist()}")

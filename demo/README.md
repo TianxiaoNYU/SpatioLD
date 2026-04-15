@@ -10,6 +10,10 @@ python demo/slidetag_style_pipeline.py
 python demo/slidetag_style_pipeline.py --plot
 ```
 
+All demos now use pooled permutation p-values by default, matching cells by
+neighborhood size so you can keep `--n-perm` small without falling back to the
+very coarse legacy per-cell p-value grid.
+
 Scripts:
 
 - `synthetic_quickstart.py`: array/DataFrame API + permutation tests.

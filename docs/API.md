@@ -14,7 +14,7 @@ Constructors:
 Main methods:
 
 - `compute_local_diversity(...)`
-- `compute_permutation_stats(...)` (single-pass p-values + null mean + distribution)
+- `compute_permutation_stats(...)` (single-pass p-values + null mean + distribution; pooled-by-neighborhood-size p-values by default)
 - `compute_permutation_pvals(...)`
 - `compute_permutation_mean(...)`
 - `compute_permutation_distribution(...)`
@@ -36,10 +36,10 @@ Main methods:
 
 - `compute_local_diversity(coords, labels, radius, ...)`
 - `compute_local_diversity_multi_radius(coords, labels, radii, ...)`
-- `compute_nd_permutation_pvals(xy, labels, n_perm, ...)`
+- `compute_nd_permutation_pvals(xy, labels, n_perm, ..., pval_pooling="neighborhood_size")`
 - `compute_nd_permutation_mean(xy, labels, n_perm, ...)`
 - `compute_nd_permutation_distribution(xy, labels, n_perm, ...)`
-- `compute_nd_permutation_stats(xy, labels, n_perm, ...)` (single-pass combined output)
+- `compute_nd_permutation_stats(xy, labels, n_perm, ..., pval_pooling="neighborhood_size")` (single-pass combined output)
 - `DEFAULT_RADII`
 
 ## Updated SlideTag-Style Pipeline
@@ -60,7 +60,7 @@ Gene-radius model utilities:
 - `prepare_shared_components(response_matrix, metadata_df, radius_values, ..., covariate_cols=None, normalize_by=None, normalize_by_global_entropy=True)`
 - `fit_single_gene_radius_model(gene_values, shared, ...)`
 - `reconstruct_radius_effect(fit_result, shared, ...)`
-- `fit_all_genes(expr_df, shared, ...)`
+- `fit_all_genes(expr_df, shared, ..., store_fit_objects=True)`
 - `fit_slide_level_cell_type_radius_model(shared, ...)`
 - `summarize_slide_level_cell_type_effects(fit_result, shared, ...)`
 - `summarize_model_terms(fit_result)`

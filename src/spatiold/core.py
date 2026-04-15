@@ -191,6 +191,15 @@ class SpatioLD:
         if store:
             store_matrix_in_anndata(self.adata, ld_df, key=key)
         return ld_df
+    
+    def compute_global_entropy(
+        self,
+        # local_diversity_key: str = "spatiold_local_diversity",
+        base: float = 2.0,
+    ) -> float:
+        """Compute global Shannon entropy from stored local diversity."""
+        # ld_df = self.get_result(local_diversity_key)
+        return _compute_global_shannon_entropy(self.labels, base=base)
 
     def compute_permutation_pvals(
         self,
@@ -202,6 +211,7 @@ class SpatioLD:
         include_self: bool = True,
         base: float = 2.0,
         alternative: str = "greater",
+        pval_pooling: str = "neighborhood_size",
         store: bool = True,
         key: str = "spatiold_local_diversity_pvals",
     ) -> pd.DataFrame:
@@ -216,6 +226,7 @@ class SpatioLD:
             include_self=include_self,
             base=base,
             alternative=alternative,
+            pval_pooling=pval_pooling,
         )
         if store:
             store_matrix_in_anndata(self.adata, pval_df, key=key)
@@ -231,6 +242,7 @@ class SpatioLD:
         include_self: bool = True,
         base: float = 2.0,
         alternative: str = "greater",
+        pval_pooling: str = "neighborhood_size",
         store: bool = True,
         pvals_key: str = "spatiold_local_diversity_pvals",
         perm_mean_key: str = "spatiold_local_diversity_perm_mean",
@@ -246,6 +258,7 @@ class SpatioLD:
             include_self=include_self,
             base=base,
             alternative=alternative,
+            pval_pooling=pval_pooling,
         )
         if store:
             store_matrix_in_anndata(self.adata, stats["pvals"], key=pvals_key)

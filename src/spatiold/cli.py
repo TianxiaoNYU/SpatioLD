@@ -347,7 +347,23 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run full SpatioLD pipeline (including permutation inference)."
     )
     _add_common_pipeline_arguments(parser)
-    parser.add_argument("--n-perm", type=int, default=100, help="Permutation count for p-values and null summaries.")
+    parser.add_argument(
+        "--n-perm",
+        type=int,
+        default=5,
+        help="Permutation count for p-values and null summaries. The default assumes pooled null p-values.",
+    )
+    parser.add_argument(
+        "--pval-pooling",
+        type=str,
+        choices=["cell", "global", "neighborhood-size"],
+        default="neighborhood-size",
+        help=(
+            "How to pool permutation-null draws for p-values: compare to each cell only "
+            "(`cell`), all permuted cells at a radius (`global`), or all permuted cells "
+            "with the same neighborhood size (`neighborhood-size`, recommended)."
+        ),
+    )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
     parser.add_argument("--alpha", type=float, default=0.05, help="Significance alpha for p-value mask.")
     parser.add_argument("--save-permutation-distribution", action="store_true", help="Also save full permutation distribution to `.npz`.")
@@ -643,12 +659,15 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     perm_mean_key = "spatiold_local_diversity_perm_mean"
 
     ld_df = obj.compute_local_diversity(radii=radii, key=ld_key)
+    global_entropy = obj.compute_global_entropy()
+    ld_df_normalized = ld_df / global_entropy if global_entropy > 0 else ld_df
     summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
     cluster_labels_df, _ = obj.cluster_local_diversity_profiles(local_diversity_key=ld_key, k_values=args.k_values)
 
     if skip_permutation:
         pvals_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         perm_mean_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        perm_mean_df_norm = perm_mean_df.copy()
         summary_null = _build_sample_only_null_summary(ld_df)
         sig_mask_df = pd.DataFrame(0, index=ld_df.index, columns=ld_df.columns, dtype=int)
         perm_dist = None
@@ -661,10 +680,12 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
             store=True,
             pvals_key=pval_key,
             perm_mean_key=perm_mean_key,
-            alternative="two-sided",
+            alternative="greater",
+            pval_pooling=args.pval_pooling,
         )
         pvals_df = perm_stats["pvals"]
         perm_mean_df = perm_stats["perm_mean"]
+        perm_mean_df_norm = perm_mean_df / global_entropy if global_entropy > 0 else perm_mean_df
         perm_dist = perm_stats["distribution"]
         summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
         sig_mask_df = obj.build_significance_mask(pvals_key=pval_key, alpha=args.alpha)
@@ -703,12 +724,15 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         shared,
         cluster_robust=not args.no_cluster_robust,
         verbose=not args.quiet,
+        store_fit_objects=False,
     )
     svg_df = obj.compute_svg_morans_i(expr_model, k=args.svg_k)
 
     ld_df.to_csv(output_dir / "local_diversity.csv")
+    ld_df_normalized.to_csv(output_dir / "local_diversity_normalized.csv")
     pvals_df.to_csv(output_dir / "local_diversity_pvals.csv")
     perm_mean_df.to_csv(output_dir / "local_diversity_perm_mean.csv")
+    perm_mean_df_norm.to_csv(output_dir / "local_diversity_perm_mean_normalized.csv")
     summary_ct.to_csv(output_dir / "summary_by_cell_type.csv", index=False)
     summary_null.to_csv(output_dir / "summary_sample_vs_null.csv", index=False)
     cluster_labels_df.to_csv(output_dir / "cluster_labels.csv")
@@ -735,6 +759,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         "radii": radii,
         "permutation_enabled": not skip_permutation,
         "n_perm": int(args.n_perm) if not skip_permutation else 0,
+        "pval_pooling": getattr(args, "pval_pooling", None) if not skip_permutation else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
 
@@ -749,6 +774,8 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         print(f"Genes after filter: {expr_aligned.shape[1]}")
         print(f"Modeled genes: {expr_model.shape[1]}")
         print(f"Radii: {radii}")
+        if not skip_permutation:
+            print(f"P-value pooling: {args.pval_pooling}")
 
 
 def run_cluster_pipeline(args: argparse.Namespace) -> None:
@@ -848,6 +875,7 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             shared,
             cluster_robust=not args.no_cluster_robust,
             verbose=not args.quiet,
+            store_fit_objects=False,
         )
         results_df["n_clusters"] = int(cluster_labels.nunique())
 
