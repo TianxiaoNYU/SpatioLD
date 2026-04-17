@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
+from scipy import linalg, sparse, stats
 from scipy.spatial import KDTree
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
@@ -364,6 +364,180 @@ def prepare_shared_components(
     }
 
 
+def _extract_long_covariates(shared: dict[str, Any]) -> tuple[np.ndarray, list[str]]:
+    covariates_long = np.asarray(
+        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
+        dtype=float,
+    )
+    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
+        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
+    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+    return covariates_long, covariate_feature_names
+
+
+def _build_gene_model_nuisance_design(
+    shared: dict[str, Any],
+    *,
+    add_intercept: bool = True,
+) -> np.ndarray:
+    covariates_long, _ = _extract_long_covariates(shared)
+    blocks = [covariates_long, np.asarray(shared["ct_long"], dtype=float), np.asarray(shared["radius_long"], dtype=float)]
+    nonempty_blocks = [block for block in blocks if block.size > 0]
+    Z = (
+        np.hstack(nonempty_blocks)
+        if nonempty_blocks
+        else np.empty((shared["y_long"].shape[0], 0), dtype=float)
+    )
+    if add_intercept:
+        intercept = np.ones((Z.shape[0], 1), dtype=float)
+        Z = np.hstack([intercept, Z])
+    return Z
+
+
+def _orthonormal_column_basis(matrix: np.ndarray) -> tuple[np.ndarray, int]:
+    if matrix.ndim != 2:
+        raise ValueError("`matrix` must be 2D.")
+    if matrix.shape[1] == 0:
+        return np.empty((matrix.shape[0], 0), dtype=float), 0
+
+    q, r, _ = linalg.qr(matrix, mode="economic", pivoting=True)
+    diag = np.abs(np.diag(r))
+    scale = float(diag.max()) if diag.size else 0.0
+    tol = np.finfo(float).eps * max(matrix.shape) * max(scale, 1.0)
+    rank = int(np.sum(diag > tol))
+    return q[:, :rank], rank
+
+
+def _fit_all_genes_batched(
+    expr_df: pd.DataFrame,
+    shared: dict[str, Any],
+    *,
+    cluster_robust: bool = True,
+    verbose: bool = True,
+    chunk_size: int = 64,
+) -> pd.DataFrame:
+    """Fit all genes with one shared nuisance projection.
+
+    This implements the same single-gene model as
+    :func:`fit_single_gene_radius_model`, but uses the Frisch-Waugh-Lovell
+    decomposition to residualize the response and each gene against the shared
+    nuisance design once and then solve the gene coefficient in chunks.
+    """
+
+    if len(expr_df) != shared["n_cells"]:
+        raise ValueError("`expr_df` must align with response matrix cell order.")
+
+    n_cells = int(shared["n_cells"])
+    n_radii = int(shared["n_radii"])
+    n_obs = int(shared["y_long"].shape[0])
+    if n_cells * n_radii != n_obs:
+        raise ValueError("Inconsistent `shared` dimensions: expected n_cells * n_radii == len(y_long).")
+
+    chunk_size = max(1, int(chunk_size))
+    y_long = np.asarray(shared["y_long"], dtype=float).reshape(-1)
+    z_matrix = _build_gene_model_nuisance_design(shared, add_intercept=True)
+    q_nuisance, nuisance_rank = _orthonormal_column_basis(z_matrix)
+
+    if nuisance_rank > 0:
+        y_tilde = y_long - q_nuisance @ (q_nuisance.T @ y_long)
+    else:
+        y_tilde = y_long.copy()
+
+    groups = np.asarray(shared["groups_long"])
+    _, group_codes = np.unique(groups, return_inverse=True)
+    order = np.argsort(group_codes, kind="stable")
+    group_codes_sorted = group_codes[order]
+    group_starts = np.r_[0, np.flatnonzero(np.diff(group_codes_sorted)) + 1]
+    n_groups = int(group_starts.size)
+
+    tss = float(np.sum((y_long - y_long.mean()) ** 2))
+    y_tilde_ss = float(np.dot(y_tilde, y_tilde))
+    n_params = nuisance_rank + 1
+    df_resid = n_obs - n_params
+    robust_scale = 1.0
+    if cluster_robust and n_groups > 1 and n_obs > n_params:
+        robust_scale = (n_groups / (n_groups - 1.0)) * ((n_obs - 1.0) / (n_obs - n_params))
+
+    summaries: list[dict[str, Any]] = []
+    gene_names = expr_df.columns.astype(str).tolist()
+    total_genes = len(gene_names)
+
+    for start in range(0, total_genes, chunk_size):
+        end = min(start + chunk_size, total_genes)
+        if verbose:
+            print(f"Fitting genes {start + 1}-{end}/{total_genes} with shared design")
+
+        gene_chunk = gene_names[start:end]
+        x_cell = expr_df.loc[:, gene_chunk].to_numpy(dtype=float, copy=False)
+        x_long = np.repeat(x_cell, repeats=n_radii, axis=0)
+
+        if nuisance_rank > 0:
+            x_tilde = x_long - q_nuisance @ (q_nuisance.T @ x_long)
+        else:
+            x_tilde = x_long.copy()
+
+        xx = np.einsum("ij,ij->j", x_tilde, x_tilde)
+        xy = x_tilde.T @ y_tilde
+
+        xx_tol = np.finfo(float).eps * max(float(np.nanmax(xx)) if xx.size else 0.0, 1.0)
+        valid = xx > xx_tol
+
+        beta = np.full(len(gene_chunk), np.nan, dtype=float)
+        beta[valid] = xy[valid] / xx[valid]
+
+        sse = np.full(len(gene_chunk), y_tilde_ss, dtype=float)
+        sse[valid] = y_tilde_ss - (beta[valid] * xy[valid])
+        sse = np.maximum(sse, 0.0)
+
+        se = np.full(len(gene_chunk), np.nan, dtype=float)
+        stat = np.full(len(gene_chunk), np.nan, dtype=float)
+        pval = np.full(len(gene_chunk), np.nan, dtype=float)
+
+        if cluster_robust:
+            prod = x_tilde * (y_tilde[:, None] - x_tilde * beta)
+            scores = np.add.reduceat(prod[order], group_starts, axis=0)
+            meat = np.einsum("ij,ij->j", scores, scores)
+            var_beta = np.full(len(gene_chunk), np.nan, dtype=float)
+            var_beta[valid] = robust_scale * meat[valid] / (xx[valid] ** 2)
+            se[valid] = np.sqrt(np.maximum(var_beta[valid], 0.0))
+            stat[valid] = beta[valid] / se[valid]
+            pval[valid] = 2.0 * stats.norm.sf(np.abs(stat[valid]))
+        elif df_resid > 0:
+            sigma2 = sse / df_resid
+            se[valid] = np.sqrt(np.maximum(sigma2[valid] / xx[valid], 0.0))
+            stat[valid] = beta[valid] / se[valid]
+            pval[valid] = 2.0 * stats.t.sf(np.abs(stat[valid]), df=df_resid)
+
+        r2 = np.full(len(gene_chunk), np.nan, dtype=float)
+        adj_r2 = np.full(len(gene_chunk), np.nan, dtype=float)
+        if tss > 0:
+            r2 = 1.0 - (sse / tss)
+            if df_resid > 0:
+                adj_r2 = 1.0 - (1.0 - r2) * ((n_obs - 1.0) / df_resid)
+
+        scale = np.maximum(sse / n_obs, np.finfo(float).tiny)
+        llf = -0.5 * n_obs * (np.log(2.0 * np.pi) + 1.0 + np.log(scale))
+        aic = -2.0 * llf + 2.0 * n_params
+        bic = -2.0 * llf + np.log(n_obs) * n_params
+
+        for offset, gene in enumerate(gene_chunk):
+            summaries.append(
+                {
+                    "gene": gene,
+                    "beta_gene": float(beta[offset]),
+                    "se_gene": float(se[offset]),
+                    "pval_gene": float(pval[offset]),
+                    "t_gene": float(stat[offset]),
+                    "r2": float(r2[offset]),
+                    "adj_r2": float(adj_r2[offset]),
+                    "aic": float(aic[offset]),
+                    "bic": float(bic[offset]),
+                }
+            )
+
+    return pd.DataFrame(summaries).sort_values("pval_gene").reset_index(drop=True)
+
+
 def fit_single_gene_radius_model(
     gene_values: np.ndarray | pd.Series,
     shared: dict[str, Any],
@@ -386,13 +560,7 @@ def fit_single_gene_radius_model(
     n_radii = shared["n_radii"]
     x_long = np.repeat(x, repeats=n_radii).reshape(-1, 1)
 
-    covariates_long = np.asarray(
-        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
-        dtype=float,
-    )
-    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
-        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
-    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+    covariates_long, covariate_feature_names = _extract_long_covariates(shared)
 
     X = np.hstack([x_long, covariates_long, shared["ct_long"], shared["radius_long"]])
     feature_names = (
@@ -431,6 +599,99 @@ def fit_single_gene_radius_model(
     return result
 
 
+def fit_joint_gene_radius_model(
+    expr_df: pd.DataFrame,
+    shared: dict[str, Any],
+    *,
+    add_intercept: bool = True,
+    cluster_robust: bool = True,
+    return_fit_object: bool = True,
+) -> dict[str, Any]:
+    """Fit one joint OLS model with all genes entered simultaneously.
+
+    Model:
+        ``E_{i,r} = X_i eta + z_i gamma + cell_type_i + f(r) + error``
+
+    where ``X_i`` contains all genes for cell ``i`` and no gene-radius
+    interaction terms are included.
+    """
+    import statsmodels.api as sms
+
+    if len(expr_df) != shared["n_cells"]:
+        raise ValueError("`expr_df` must align with response matrix cell order.")
+
+    gene_names = expr_df.columns.astype(str).tolist()
+    if len(set(gene_names)) != len(gene_names):
+        raise ValueError("`expr_df` must have unique gene names.")
+
+    n_radii = int(shared["n_radii"])
+    x_cell = expr_df.to_numpy(dtype=float, copy=False)
+    x_long = np.repeat(x_cell, repeats=n_radii, axis=0)
+
+    covariates_long, covariate_feature_names = _extract_long_covariates(shared)
+
+    X = np.hstack([x_long, covariates_long, shared["ct_long"], shared["radius_long"]])
+    feature_names = (
+        gene_names
+        + covariate_feature_names
+        + shared["ct_feature_names"]
+        + shared["radius_feature_names"]
+    )
+
+    if add_intercept:
+        X = sms.add_constant(X, has_constant="add")
+        feature_names = ["const"] + feature_names
+
+    model = sms.OLS(shared["y_long"], X)
+    if cluster_robust:
+        fit_res = model.fit(cov_type="cluster", cov_kwds={"groups": shared["groups_long"]})
+    else:
+        fit_res = model.fit()
+
+    coef = pd.Series(fit_res.params, index=feature_names)
+    se = pd.Series(fit_res.bse, index=feature_names)
+    pval = pd.Series(fit_res.pvalues, index=feature_names)
+
+    result = {
+        "coef": coef,
+        "se": se,
+        "pval": pval,
+        "feature_names": feature_names,
+        "gene_feature_names": gene_names,
+        "nuisance_feature_names": [name for name in feature_names if name not in gene_names],
+        "rsquared": float(fit_res.rsquared),
+        "rsquared_adj": float(fit_res.rsquared_adj),
+        "aic": float(fit_res.aic),
+        "bic": float(fit_res.bic),
+    }
+    if return_fit_object:
+        result["fit"] = fit_res
+
+    term_summary = summarize_model_terms(result)
+    gene_summary = (
+        term_summary.loc[term_summary["term"].isin(gene_names), ["term", "beta", "se", "pval", "t"]]
+        .rename(
+            columns={
+                "term": "gene",
+                "beta": "beta_gene",
+                "se": "se_gene",
+                "pval": "pval_gene",
+                "t": "t_gene",
+            }
+        )
+        .sort_values("pval_gene")
+        .reset_index(drop=True)
+    )
+    nuisance_summary = (
+        term_summary.loc[~term_summary["term"].isin(gene_names)]
+        .reset_index(drop=True)
+    )
+
+    result["gene_summary"] = gene_summary
+    result["nuisance_summary"] = nuisance_summary
+    return result
+
+
 def fit_slide_level_cell_type_radius_model(
     shared: dict[str, Any],
     *,
@@ -444,13 +705,7 @@ def fit_slide_level_cell_type_radius_model(
     """
     import statsmodels.api as sms
 
-    covariates_long = np.asarray(
-        shared.get("covariates_long", np.empty((shared["y_long"].shape[0], 0), dtype=float)),
-        dtype=float,
-    )
-    if covariates_long.ndim != 2 or covariates_long.shape[0] != shared["y_long"].shape[0]:
-        raise ValueError("`shared['covariates_long']` must be a 2D array with one row per long-form sample.")
-    covariate_feature_names = list(shared.get("covariate_feature_names", []))
+    covariates_long, covariate_feature_names = _extract_long_covariates(shared)
 
     X = np.hstack([covariates_long, shared["ct_long"], shared["radius_long"]])
     feature_names = covariate_feature_names + shared["ct_feature_names"] + shared["radius_feature_names"]
@@ -580,16 +835,46 @@ def fit_all_genes(
     cluster_robust: bool = True,
     verbose: bool = True,
     store_fit_objects: bool = True,
+    method: str = "auto",
+    chunk_size: int = 64,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, Any]]]:
-    """Fit all genes one by one and return summary table + optional full fit objects.
+    """Fit all genes and return summary table + optional per-gene fit objects.
 
-    Keeping full fit objects is convenient for downstream inspection, but on
-    large slides it can consume a lot of memory because each statsmodels fit
-    retains the dense long-form design matrix. Set ``store_fit_objects=False``
-    for memory-efficient bulk fitting.
+    Parameters
+    ----------
+    method
+        ``"auto"`` uses the shared batched solver when
+        ``store_fit_objects=False`` and falls back to the legacy per-gene
+        statsmodels loop when full fit objects are requested. Use
+        ``"batch"`` to force the shared solver, or ``"single"`` to force the
+        legacy one-by-one implementation.
+    chunk_size
+        Number of genes processed at a time by the shared batched solver.
     """
     if len(expr_df) != shared["n_cells"]:
         raise ValueError("`expr_df` must align with response matrix cell order.")
+
+    method_normalized = str(method).lower()
+    if method_normalized not in {"auto", "batch", "single"}:
+        raise ValueError("`method` must be one of {'auto', 'batch', 'single'}.")
+
+    if method_normalized == "auto":
+        method_normalized = "single" if store_fit_objects else "batch"
+
+    if method_normalized == "batch":
+        if store_fit_objects:
+            raise ValueError(
+                "`store_fit_objects=True` is only supported with `method='single'`. "
+                "Use `store_fit_objects=False` for the shared all-gene solver."
+            )
+        summary_df = _fit_all_genes_batched(
+            expr_df,
+            shared,
+            cluster_robust=cluster_robust,
+            verbose=verbose,
+            chunk_size=chunk_size,
+        )
+        return summary_df, {}
 
     summaries = []
     fit_objects: dict[str, dict[str, Any]] = {}

@@ -106,8 +106,14 @@ shared = obj.prepare_shared_components(
     normalize_by_global_entropy=True,
 )
 results_df, fit_objects = sld.fit_all_genes(expr_df, shared)
-# For large slides, avoid retaining every statsmodels fit in memory:
+# For large slides, this switches to the shared batched all-gene solver:
 results_df_only, _ = sld.fit_all_genes(expr_df, shared, store_fit_objects=False)
+# You can also force the batched solver explicitly:
+results_df_batch, _ = sld.fit_all_genes(expr_df, shared, store_fit_objects=False, method="batch")
+
+# true joint model: all genes enter the same OLS, still adjusting for cell type and radius
+joint_fit = sld.fit_joint_gene_radius_model(expr_df, shared)
+joint_gene_df = joint_fit["gene_summary"]
 
 # slide-level cell-type model (fit once per slide)
 ct_fit = sld.fit_slide_level_cell_type_radius_model(shared)
@@ -131,6 +137,12 @@ spatiold-pipeline \
   --n-perm 10 \
   --pval-pooling neighborhood-size \
   --min-genes-per-cell 10
+```
+
+To switch from the default single-gene regression workflow to the joint all-gene OLS in the CLI, add:
+
+```bash
+  --gene-model-mode joint
 ```
 
 Or run directly from a single AnnData file:

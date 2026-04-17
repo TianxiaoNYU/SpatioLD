@@ -24,6 +24,7 @@ Main methods:
 - `cluster_local_diversity_profiles(...)`
 - `build_significance_mask(...)`
 - `prepare_shared_components(...)` (regression response is entropy-normalized by default)
+- `fit_joint_gene_radius_model(...)`
 - `fit_slide_level_cell_type_radius_model(...)`
 - `summarize_slide_level_cell_type_effects(...)`
 - `summarize_model_terms(...)`
@@ -59,8 +60,15 @@ Gene-radius model utilities:
 - `make_spline_basis(radius_values, ...)`
 - `prepare_shared_components(response_matrix, metadata_df, radius_values, ..., covariate_cols=None, normalize_by=None, normalize_by_global_entropy=True)`
 - `fit_single_gene_radius_model(gene_values, shared, ...)`
+- `fit_joint_gene_radius_model(expr_df, shared, ...)`
+  - fits one joint OLS with all genes entered simultaneously
+  - still adjusts for optional covariates, cell-type indicators, and radius basis terms
+  - does not include gene-radius interaction terms
 - `reconstruct_radius_effect(fit_result, shared, ...)`
-- `fit_all_genes(expr_df, shared, ..., store_fit_objects=True)`
+- `fit_all_genes(expr_df, shared, ..., store_fit_objects=True, method="auto", chunk_size=64)`
+  - `method="auto"` uses the new shared batched all-gene solver whenever `store_fit_objects=False`
+  - `method="single"` keeps the original one-gene-at-a-time statsmodels path
+  - `method="batch"` forces the shared all-gene solver
 - `fit_slide_level_cell_type_radius_model(shared, ...)`
 - `summarize_slide_level_cell_type_effects(fit_result, shared, ...)`
 - `summarize_model_terms(fit_result)`

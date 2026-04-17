@@ -12,6 +12,7 @@ from spatiold import (
     compute_sample_vs_null_summary,
     compute_svg_morans_i,
     fit_all_genes,
+    fit_joint_gene_radius_model,
     fit_slide_level_cell_type_radius_model,
     fit_single_gene_radius_model,
     prepare_shared_components,
@@ -123,6 +124,138 @@ def test_fit_all_genes_can_skip_retaining_full_fit_objects() -> None:
 
     assert results_df.shape[0] == expr.shape[1]
     assert fit_objects == {}
+
+
+def test_joint_gene_radius_model_recovers_known_coefficients() -> None:
+    pytest.importorskip("statsmodels")
+
+    rng = np.random.default_rng(23)
+    n_cells = 45
+    radii = [10.0, 25.0, 40.0, 55.0]
+    cell_ids = [f"c{i}" for i in range(n_cells)]
+
+    expr = pd.DataFrame(
+        rng.normal(size=(n_cells, 3)),
+        index=cell_ids,
+        columns=["g0", "g1", "g2"],
+    )
+    meta = pd.DataFrame(
+        {
+            "cell_type": ["A"] * 20 + ["B"] * 15 + ["C"] * 10,
+            "cell_size": rng.uniform(50, 200, size=n_cells),
+        },
+        index=cell_ids,
+    )
+
+    shared_template = prepare_shared_components(
+        response_matrix=np.zeros((n_cells, len(radii)), dtype=float),
+        metadata_df=meta,
+        radius_values=radii,
+        cell_type_col="cell_type",
+        reference_cell_type="A",
+        radius_mode="poly",
+        poly_degree=2,
+        covariate_cols=["cell_size"],
+        normalize_by_global_entropy=False,
+    )
+
+    gene_beta = np.array([1.4, -0.9, 0.6], dtype=float)
+    cov_beta = np.array([0.03], dtype=float)
+    ct_beta = np.array([0.8, -0.5], dtype=float)
+    radius_beta = np.array([0.35, -0.15], dtype=float)
+    intercept = 0.7
+
+    x_long = np.repeat(expr.to_numpy(dtype=float), repeats=len(radii), axis=0)
+    y_long = (
+        intercept
+        + x_long @ gene_beta
+        + shared_template["covariates_long"] @ cov_beta
+        + shared_template["ct_long"] @ ct_beta
+        + shared_template["radius_long"] @ radius_beta
+        + rng.normal(scale=0.03, size=n_cells * len(radii))
+    )
+    Y = y_long.reshape(n_cells, len(radii))
+
+    shared = prepare_shared_components(
+        response_matrix=Y,
+        metadata_df=meta,
+        radius_values=radii,
+        cell_type_col="cell_type",
+        reference_cell_type="A",
+        radius_mode="poly",
+        poly_degree=2,
+        covariate_cols=["cell_size"],
+        normalize_by_global_entropy=False,
+    )
+
+    fit = fit_joint_gene_radius_model(
+        expr,
+        shared,
+        cluster_robust=False,
+    )
+
+    gene_summary = fit["gene_summary"].set_index("gene")
+    np.testing.assert_allclose(gene_summary.loc["g0", "beta_gene"], gene_beta[0], atol=0.05)
+    np.testing.assert_allclose(gene_summary.loc["g1", "beta_gene"], gene_beta[1], atol=0.05)
+    np.testing.assert_allclose(gene_summary.loc["g2", "beta_gene"], gene_beta[2], atol=0.05)
+    assert "covariate_cell_size" in fit["coef"].index
+    assert any(term.startswith("cell_type_") for term in fit["coef"].index)
+    assert any(term.startswith("poly_radius_") for term in fit["coef"].index)
+
+
+@pytest.mark.parametrize("cluster_robust", [False, True])
+def test_fit_all_genes_batch_matches_single_loop(cluster_robust: bool) -> None:
+    pytest.importorskip("statsmodels")
+
+    coords, labels, meta = _make_small_dataset()
+    ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30, 40])
+
+    rng = np.random.default_rng(19)
+    expr = pd.DataFrame(
+        rng.normal(size=(ld.shape[0], 6)),
+        index=ld.index,
+        columns=[f"g{i}" for i in range(6)],
+    )
+
+    shared = prepare_shared_components(
+        response_matrix=ld.values,
+        metadata_df=meta.loc[ld.index],
+        radius_values=[10, 20, 30, 40],
+        cell_type_col="cell_type",
+        radius_mode="poly",
+        poly_degree=3,
+        covariate_cols=["cell_size"],
+    )
+
+    single_df, _ = fit_all_genes(
+        expr,
+        shared,
+        cluster_robust=cluster_robust,
+        verbose=False,
+        store_fit_objects=False,
+        method="single",
+    )
+    batch_df, _ = fit_all_genes(
+        expr,
+        shared,
+        cluster_robust=cluster_robust,
+        verbose=False,
+        store_fit_objects=False,
+        method="batch",
+        chunk_size=2,
+    )
+
+    single_sorted = single_df.sort_values("gene").reset_index(drop=True)
+    batch_sorted = batch_df.sort_values("gene").reset_index(drop=True)
+
+    assert single_sorted["gene"].tolist() == batch_sorted["gene"].tolist()
+    for col in ["beta_gene", "se_gene", "pval_gene", "t_gene", "r2", "adj_r2", "aic", "bic"]:
+        np.testing.assert_allclose(
+            single_sorted[col].to_numpy(),
+            batch_sorted[col].to_numpy(),
+            rtol=1e-5,
+            atol=1e-7,
+        )
 
 
 def test_prepare_shared_components_entropy_normalization_controls() -> None:

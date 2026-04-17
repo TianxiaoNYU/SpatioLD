@@ -16,6 +16,7 @@ from .pipeline import (
     align_expression_and_metadata,
     compute_hvg_scanpy,
     fit_all_genes,
+    fit_joint_gene_radius_model,
     fit_single_gene_radius_model,
     fit_slide_level_cell_type_radius_model,
     prepare_shared_components,
@@ -328,6 +329,16 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--n-radius-knots", type=int, default=5, help="Spline knots when `--radius-mode spline`.")
     parser.add_argument("--spline-degree", type=int, default=3, help="Spline degree when `--radius-mode spline`.")
     parser.add_argument(
+        "--gene-model-mode",
+        type=str,
+        choices=["single", "joint"],
+        default="single",
+        help=(
+            "Gene-modeling mode: `single` fits the existing one-gene-at-a-time pipeline, "
+            "while `joint` fits one OLS with all modeled genes entered together."
+        ),
+    )
+    parser.add_argument(
         "--regression-normalize-by",
         type=float,
         default=None,
@@ -601,6 +612,37 @@ def _select_hvg_with_fallback(
         return hvg_df.head(n_top_hvg)
 
 
+def _fit_gene_model_for_pipeline(
+    expr_model: pd.DataFrame,
+    shared: dict[str, object],
+    *,
+    gene_model_mode: str,
+    cluster_robust: bool,
+    quiet: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    mode = str(gene_model_mode).lower()
+    if mode == "single":
+        results_df, _ = fit_all_genes(
+            expr_model,
+            shared,
+            cluster_robust=cluster_robust,
+            verbose=not quiet,
+            store_fit_objects=False,
+        )
+        return results_df, None
+
+    if mode == "joint":
+        joint_fit = fit_joint_gene_radius_model(
+            expr_model,
+            shared,
+            cluster_robust=cluster_robust,
+            return_fit_object=False,
+        )
+        return joint_fit["gene_summary"], summarize_model_terms(joint_fit)
+
+    raise ValueError(f"Unsupported gene model mode: {gene_model_mode}")
+
+
 def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) -> None:
     radii = _parse_radii(args.radii)
     output_dir = args.output_dir.resolve()
@@ -719,12 +761,12 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     hvg_genes = hvg_df.index.astype(str).tolist()
     expr_model = expr_aligned.loc[:, hvg_genes].copy()
 
-    results_df, _ = fit_all_genes(
+    results_df, gene_model_terms_df = _fit_gene_model_for_pipeline(
         expr_model,
         shared,
+        gene_model_mode=args.gene_model_mode,
         cluster_robust=not args.no_cluster_robust,
-        verbose=not args.quiet,
-        store_fit_objects=False,
+        quiet=args.quiet,
     )
     svg_df = obj.compute_svg_morans_i(expr_model, k=args.svg_k)
 
@@ -740,6 +782,11 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     slide_ct_terms_df.to_csv(output_dir / "slide_cell_type_radius_model_terms.csv", index=False)
     slide_ct_effects_df.to_csv(output_dir / "slide_cell_type_effects.csv", index=False)
     results_df.to_csv(output_dir / "gene_radius_model_results.csv", index=False)
+    gene_model_terms_path = output_dir / "gene_radius_model_terms.csv"
+    if gene_model_terms_df is not None:
+        gene_model_terms_df.to_csv(gene_model_terms_path, index=False)
+    elif gene_model_terms_path.exists():
+        gene_model_terms_path.unlink()
     svg_df.to_csv(output_dir / "svg_morans_i.csv", index=False)
 
     if (not skip_permutation) and getattr(args, "save_permutation_distribution", False):
@@ -755,6 +802,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         "reference_cell_type": str(shared["reference_cell_type"]),
         "response_normalization_factor": shared["response_normalization_factor"],
         "covariate_cols": shared.get("covariate_cols", []),
+        "gene_model_mode": str(args.gene_model_mode),
         "n_radii": int(len(radii)),
         "radii": radii,
         "permutation_enabled": not skip_permutation,
@@ -773,6 +821,7 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")
         print(f"Modeled genes: {expr_model.shape[1]}")
+        print(f"Gene model mode: {args.gene_model_mode}")
         print(f"Radii: {radii}")
         if not skip_permutation:
             print(f"P-value pooling: {args.pval_pooling}")
