@@ -18,16 +18,15 @@ from .modeling import (
 from .permutation import (
     compute_nd_permutation_distribution,
     compute_nd_permutation_mean,
-    compute_nd_permutation_pvals,
     compute_nd_permutation_stats,
+    compute_nd_permutation_std,
 )
 from .pipeline import (
     align_expression_and_metadata,
-    build_significance_mask,
-    cluster_local_diversity_profiles,
     compute_global_shannon_entropy,
     compute_hvg_scanpy,
     compute_sample_vs_null_summary,
+    compute_sample_vs_null_summary_from_permutation_means,
     compute_svg_morans_i,
     fit_all_genes,
     fit_joint_gene_radius_model,
@@ -44,10 +43,8 @@ from .pipeline import (
 from .plotting import (
     plot_gene_effect_volcano,
     plot_gene_set_venn,
-    plot_kmeans_spatial_maps,
     plot_mean_diversity_by_cell_type,
     plot_sample_vs_null_curve,
-    plot_significant_diversity_maps,
     plot_spatial_cell_types,
 )
 
@@ -57,8 +54,8 @@ __all__ = [
     "compute_local_diversity",
     "compute_local_diversity_multi_radius",
     "compute_neighborhood_diversity",
-    "compute_nd_permutation_pvals",
     "compute_nd_permutation_mean",
+    "compute_nd_permutation_std",
     "compute_nd_permutation_distribution",
     "compute_nd_permutation_stats",
     "compute_global_shannon_entropy",
@@ -66,8 +63,7 @@ __all__ = [
     "align_expression_and_metadata",
     "summarize_local_diversity_by_cell_type",
     "compute_sample_vs_null_summary",
-    "cluster_local_diversity_profiles",
-    "build_significance_mask",
+    "compute_sample_vs_null_summary_from_permutation_means",
     "make_spline_basis",
     "prepare_shared_components",
     "fit_single_gene_radius_model",
@@ -82,8 +78,6 @@ __all__ = [
     "plot_spatial_cell_types",
     "plot_mean_diversity_by_cell_type",
     "plot_sample_vs_null_curve",
-    "plot_kmeans_spatial_maps",
-    "plot_significant_diversity_maps",
     "plot_gene_effect_volcano",
     "plot_gene_set_venn",
     "prepare_radius_design",

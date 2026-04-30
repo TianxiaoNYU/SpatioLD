@@ -46,6 +46,7 @@ def _make_args(
         no_cluster_robust=True,
         quiet=True,
         n_perm=5,
+        n_jobs=1,
         pval_pooling="neighborhood-size",
         random_state=0,
         alpha=0.05,
@@ -61,6 +62,7 @@ def _write_small_inputs(tmp_path: Path) -> tuple[Path, Path]:
             "x": [0.0, 1.0, 0.0, 1.0, 2.0, 2.5],
             "y": [0.0, 0.0, 1.0, 1.0, 0.5, 1.5],
             "cell_type": ["A", "A", "B", "B", "A", "B"],
+            "cell_size": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
         }
     )
     expr = pd.DataFrame(
@@ -204,5 +206,137 @@ def test_run_pipeline_gene_model_switch_dispatches_correct_fitter(
         assert "term" in terms_df.columns
         assert set(hvg_cols).issubset(set(terms_df["term"]))
 
+    metadata_df = pd.read_csv(output_dir / "metadata.csv")
+    assert list(metadata_df.columns[:5]) == ["cell_id", "x", "y", "cell_type", "cell_size"]
+    assert metadata_df["cell_id"].tolist() == [f"c{i}" for i in range(6)]
+
     summary = json.loads((output_dir / "run_summary.json").read_text())
     assert summary["gene_model_mode"] == gene_model_mode
+
+
+def test_run_pipeline_skip_gene_model_skips_svg_and_keeps_other_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metadata_path, expression_path = _write_small_inputs(tmp_path)
+    output_dir = tmp_path / "out_skip_gene_model"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    args = _make_args(
+        metadata_path=metadata_path,
+        expression_path=expression_path,
+        output_dir=output_dir,
+        gene_model_mode="single",
+    )
+
+    hvg_cols = ["g0", "g1", "g2"]
+    hvg_df = pd.DataFrame(
+        {
+            "means": [1.0, 1.1, 1.2],
+            "dispersions": [2.0, 1.9, 1.8],
+            "dispersions_norm": [2.0, 1.9, 1.8],
+        },
+        index=hvg_cols,
+    )
+
+    def _fake_select_hvg(
+        expr_df: pd.DataFrame,
+        *,
+        n_top_hvg: int,
+        hvg_flavor: str,
+        quiet: bool,
+    ) -> pd.DataFrame:
+        del expr_df, hvg_flavor, quiet
+        return hvg_df.head(n_top_hvg)
+
+    def _fail_gene_fit(*args, **kwargs):
+        raise AssertionError("Gene-model fitter should not run when skip_gene_model=True.")
+
+    def _fail_svg(*args, **kwargs):
+        raise AssertionError("SVG scoring should not run when skip_svg=True.")
+
+    monkeypatch.setattr(cli, "_select_hvg_with_fallback", _fake_select_hvg)
+    monkeypatch.setattr(cli, "fit_all_genes", _fail_gene_fit)
+    monkeypatch.setattr(cli, "fit_joint_gene_radius_model", _fail_gene_fit)
+    monkeypatch.setattr(cli.SpatioLD, "compute_svg_morans_i", _fail_svg)
+
+    stale_results = output_dir / "gene_radius_model_results.csv"
+    stale_terms = output_dir / "gene_radius_model_terms.csv"
+    stale_svg = output_dir / "svg_morans_i.csv"
+    stale_results.write_text("stale\n")
+    stale_terms.write_text("stale\n")
+    stale_svg.write_text("stale\n")
+
+    cli.run_pipeline(args, skip_permutation=True, skip_gene_model=True, skip_svg=True)
+
+    assert not stale_results.exists()
+    assert not stale_terms.exists()
+    assert not stale_svg.exists()
+    assert (output_dir / "local_diversity.csv").exists()
+    assert (output_dir / "slide_cell_type_effects.csv").exists()
+    metadata_df = pd.read_csv(output_dir / "metadata.csv")
+    assert list(metadata_df.columns[:5]) == ["cell_id", "x", "y", "cell_type", "cell_size"]
+
+    summary = json.loads((output_dir / "run_summary.json").read_text())
+    assert summary["gene_model_enabled"] is False
+    assert summary["gene_model_mode"] is None
+    assert summary["n_model_genes"] == 0
+    assert summary["svg_enabled"] is False
+    assert summary["n_svg_genes"] == 0
+
+
+def test_run_pipeline_lite_accepts_metadata_only_input(
+    tmp_path: Path,
+) -> None:
+    metadata_path, expression_path = _write_small_inputs(tmp_path)
+    output_dir = tmp_path / "out_metadata_only_lite"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    args = _make_args(
+        metadata_path=metadata_path,
+        expression_path=expression_path,
+        output_dir=output_dir,
+        gene_model_mode="single",
+    )
+    args.expression = None
+
+    cli.run_pipeline(args, skip_permutation=True, skip_gene_model=True, skip_svg=True)
+
+    assert (output_dir / "local_diversity.csv").exists()
+    assert (output_dir / "slide_cell_type_effects.csv").exists()
+    assert not (output_dir / "gene_radius_model_results.csv").exists()
+    assert not (output_dir / "svg_morans_i.csv").exists()
+
+    metadata_df = pd.read_csv(output_dir / "metadata.csv")
+    assert list(metadata_df.columns[:5]) == ["cell_id", "x", "y", "cell_type", "cell_size"]
+    assert metadata_df["cell_id"].tolist() == [f"c{i}" for i in range(6)]
+
+    summary = json.loads((output_dir / "run_summary.json").read_text())
+    assert summary["metadata_only_input"] is True
+    assert summary["n_genes_after_filter"] == 0
+    assert summary["gene_model_enabled"] is False
+    assert summary["svg_enabled"] is False
+
+
+def test_run_pipeline_permutation_summary_works_without_saving_distribution(
+    tmp_path: Path,
+) -> None:
+    metadata_path, expression_path = _write_small_inputs(tmp_path)
+    output_dir = tmp_path / "out_perm_summary_only"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    args = _make_args(
+        metadata_path=metadata_path,
+        expression_path=expression_path,
+        output_dir=output_dir,
+        gene_model_mode="single",
+    )
+
+    cli.run_pipeline(args, skip_gene_model=True, skip_svg=True)
+
+    assert (output_dir / "summary_sample_vs_null.csv").exists()
+    assert not (output_dir / "permutation_distribution.npz").exists()
+
+    summary = json.loads((output_dir / "run_summary.json").read_text())
+    assert summary["permutation_enabled"] is True
+    assert summary["n_jobs"] == 1

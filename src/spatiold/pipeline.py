@@ -9,8 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy import linalg, sparse, stats
 from scipy.spatial import KDTree
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import OneHotEncoder, SplineTransformer, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, SplineTransformer
 
 
 def compute_global_shannon_entropy(
@@ -165,38 +164,57 @@ def compute_sample_vs_null_summary(
     return out
 
 
-def cluster_local_diversity_profiles(
+def compute_sample_vs_null_summary_from_permutation_means(
     local_diversity_df: pd.DataFrame,
+    permutation_means_by_radius: np.ndarray,
     *,
-    k_values: Sequence[int] = (2, 3, 4, 5),
-    scale: bool = True,
-    random_state: int = 42,
-    n_init: int = 20,
-) -> tuple[pd.DataFrame, dict[int, KMeans]]:
-    """Cluster local-diversity profiles of cells across radii using KMeans."""
-    X = local_diversity_df.to_numpy(dtype=float)
-    if scale:
-        X = StandardScaler().fit_transform(X)
-
-    labels_df = pd.DataFrame(index=local_diversity_df.index.astype(str))
-    models: dict[int, KMeans] = {}
-
-    for k in k_values:
-        model = KMeans(n_clusters=int(k), random_state=random_state, n_init=n_init)
-        labels = model.fit_predict(X)
-        models[int(k)] = model
-        labels_df[f"ld_kmeans_k{k}"] = labels.astype(str)
-
-    return labels_df, models
-
-
-def build_significance_mask(
-    pvals_df: pd.DataFrame,
-    *,
-    alpha: float = 0.05,
+    normalize_by: float | None = None,
+    ci: tuple[float, float] = (2.5, 97.5),
 ) -> pd.DataFrame:
-    """Return binary significance mask (`1` if p < alpha else `0`)."""
-    return (pvals_df < alpha).astype(int)
+    """Summarize sample vs permutation-null diversity using per-permutation means.
+
+    Parameters
+    ----------
+    local_diversity_df
+        DataFrame with shape ``(n_cells, n_radii)``.
+    permutation_means_by_radius
+        Array with shape ``(n_perm, n_radii)`` containing the mean local
+        diversity across cells for each permutation and radius.
+    """
+    ld = local_diversity_df.copy()
+    ld.columns = [float(c) for c in ld.columns]
+    obs = ld.to_numpy(dtype=float).T  # (n_radii, n_cells)
+
+    perm_means = np.asarray(permutation_means_by_radius, dtype=float)
+    if perm_means.ndim != 2:
+        raise ValueError("`permutation_means_by_radius` must be 2D (n_perm, n_radii).")
+    if perm_means.shape[1] != obs.shape[0]:
+        raise ValueError(
+            "`permutation_means_by_radius` shape mismatch. Expected "
+            f"(n_perm, {obs.shape[0]}), got {perm_means.shape}."
+        )
+
+    sample_mean = obs.mean(axis=1)
+    sample_std = obs.std(axis=1)
+    null_mean = perm_means.mean(axis=0)
+    q_low, q_high = np.percentile(perm_means, ci, axis=0)
+
+    out = pd.DataFrame(
+        {
+            "radius": ld.columns,
+            "sample_mean": sample_mean,
+            "sample_std": sample_std,
+            "null_mean": null_mean,
+            "null_ci_low": q_low,
+            "null_ci_high": q_high,
+        }
+    )
+
+    if normalize_by is not None:
+        for col in ["sample_mean", "sample_std", "null_mean", "null_ci_low", "null_ci_high"]:
+            out[col] = out[col] / normalize_by
+
+    return out
 
 
 def make_spline_basis(
@@ -231,12 +249,12 @@ def prepare_shared_components(
     poly_degree: int = 3,
     covariate_cols: Sequence[str] | None = None,
     normalize_by: float | None = None,
-    normalize_by_global_entropy: bool = True,
+    normalize_by_global_entropy: bool = False,
 ) -> dict[str, Any]:
     """Prepare shared design components for per-gene radius model fitting.
 
-    By default, response values are normalized by sample-level global entropy
-    of `cell_type_col` to improve comparability across samples.
+    By default, the response matrix is used as provided. Full pipeline runs can
+    pass matched-null z-scores here for permutation-standardized modeling.
     """
     Y = np.asarray(response_matrix, dtype=float)
     n_cells, n_radii = Y.shape

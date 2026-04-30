@@ -63,10 +63,11 @@ def _write_small_inputs(tmp_path: Path) -> tuple[Path, Path, pd.Series]:
     cell_ids = [f"c{i}" for i in range(6)]
     meta = pd.DataFrame(
         {
+            "unique_id": cell_ids,
             "x": [0.0, 1.0, 0.0, 1.0, 2.0, 2.5],
             "y": [0.0, 0.0, 1.0, 1.0, 0.5, 1.5],
-        },
-        index=cell_ids,
+            "cell_size": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+        }
     )
     expr = pd.DataFrame(
         np.array(
@@ -91,7 +92,7 @@ def _write_small_inputs(tmp_path: Path) -> tuple[Path, Path, pd.Series]:
 
     metadata_path = tmp_path / "metadata.csv"
     expression_path = tmp_path / "expression.csv"
-    meta.to_csv(metadata_path)
+    meta.to_csv(metadata_path, index=False)
     expr.to_csv(expression_path)
     return metadata_path, expression_path, labels
 
@@ -182,6 +183,10 @@ def test_cluster_pipeline_simplify_switches_clustering_frequency(
     if simplify:
         for gene in hvg_cols:
             assert cluster_meta[gene].astype(str).equals(fixed_labels.loc[cluster_meta.index].astype(str))
+
+    metadata_df = pd.read_csv(output_dir / "metadata.csv")
+    assert list(metadata_df.columns[:4]) == ["cell_id", "x", "y", "cell_size"]
+    assert metadata_df["cell_id"].tolist() == [f"c{i}" for i in range(6)]
 
     summary = json.loads((output_dir / "run_summary.json").read_text())
     assert summary["simplify"] is simplify

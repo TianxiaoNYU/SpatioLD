@@ -31,8 +31,8 @@ dev = [
 ]
 
 [project.scripts]
-spatiold-pipeline = "spatiold.cli:main"
-spatiold-pipeline-slim = "spatiold.cli:main_slim"
+spatiold = "spatiold.cli:main"
+spatiold-lite = "spatiold.cli:main_no_gene_model"
 spatiold-cluster = "spatiold.cli:main_cluster"
 
 [tool.setuptools]

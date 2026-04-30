@@ -5,11 +5,12 @@ import pandas as pd
 import pytest
 
 from spatiold import (
-    cluster_local_diversity_profiles,
     compute_global_shannon_entropy,
     compute_local_diversity_multi_radius,
     compute_nd_permutation_distribution,
+    compute_nd_permutation_stats,
     compute_sample_vs_null_summary,
+    compute_sample_vs_null_summary_from_permutation_means,
     compute_svg_morans_i,
     fit_all_genes,
     fit_joint_gene_radius_model,
@@ -43,7 +44,7 @@ def _make_small_dataset() -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     return coords, labels, meta
 
 
-def test_pipeline_summaries_and_clustering() -> None:
+def test_pipeline_summaries_and_null_curve() -> None:
     coords, labels, meta = _make_small_dataset()
     ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30])
 
@@ -55,10 +56,24 @@ def test_pipeline_summaries_and_clustering() -> None:
     summary_null = compute_sample_vs_null_summary(ld, dist, normalize_by=entropy)
     assert {"radius", "sample_mean", "null_mean", "null_ci_low", "null_ci_high"}.issubset(summary_null.columns)
 
-    labels_df, models = cluster_local_diversity_profiles(ld, k_values=(2, 3))
-    assert labels_df.shape[0] == ld.shape[0]
-    assert set(labels_df.columns) == {"ld_kmeans_k2", "ld_kmeans_k3"}
-    assert set(models.keys()) == {2, 3}
+
+def test_sample_vs_null_summary_from_permutation_means_matches_distribution_summary() -> None:
+    coords, labels, _ = _make_small_dataset()
+    ld = compute_local_diversity_multi_radius(coords, labels, radii=[10, 20, 30])
+    stats = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=8,
+        radii=[10, 20, 30],
+        n_jobs=1,
+        return_distribution=True,
+        return_permutation_means=True,
+    )
+
+    from_dist = compute_sample_vs_null_summary(ld, stats["distribution"])
+    from_means = compute_sample_vs_null_summary_from_permutation_means(ld, stats["permutation_means"])
+
+    pd.testing.assert_frame_equal(from_dist, from_means)
 
 
 def test_gene_radius_model_and_svg() -> None:
@@ -269,8 +284,6 @@ def test_prepare_shared_components_entropy_normalization_controls() -> None:
     )
     Y = np.full((4, 3), 2.0, dtype=float)
     radii = [10.0, 20.0, 30.0]
-    entropy = compute_global_shannon_entropy(meta["cell_type"])
-
     shared_default = prepare_shared_components(
         response_matrix=Y,
         metadata_df=meta,
@@ -279,8 +292,8 @@ def test_prepare_shared_components_entropy_normalization_controls() -> None:
         radius_mode="poly",
         poly_degree=2,
     )
-    assert np.isclose(shared_default["response_normalization_factor"], entropy)
-    assert np.allclose(shared_default["Y"], Y / entropy)
+    assert shared_default["response_normalization_factor"] is None
+    assert np.allclose(shared_default["Y"], Y)
 
     shared_fixed = prepare_shared_components(
         response_matrix=Y,

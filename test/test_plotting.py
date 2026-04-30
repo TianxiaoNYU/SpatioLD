@@ -12,10 +12,8 @@ matplotlib.use("Agg")
 
 from spatiold import (
     plot_gene_effect_volcano,
-    plot_kmeans_spatial_maps,
     plot_mean_diversity_by_cell_type,
     plot_sample_vs_null_curve,
-    plot_significant_diversity_maps,
     plot_spatial_cell_types,
 )
 
@@ -50,17 +48,11 @@ def test_basic_plotting_helpers() -> None:
             "null_ci_high": [0.3, 0.4],
         }
     )
-
-    pvals = pd.DataFrame({10: [0.01, 0.2, 0.9, 0.03, 0.8, 0.5], 20: [0.02, 0.3, 0.7, 0.4, 0.9, 0.04]}, index=meta.index)
-    labels_df = pd.DataFrame({"ld_kmeans_k2": ["0", "0", "1", "1", "1", "0"]}, index=meta.index)
     results_df = pd.DataFrame({"beta_gene": [0.2, -0.1, 0.5], "pval_gene": [0.01, 0.2, 1e-4]})
 
     ax1 = plot_spatial_cell_types(meta)
     ax2 = plot_mean_diversity_by_cell_type(summary_ct)
     ax3 = plot_sample_vs_null_curve(summary_null)
-    fig4, _ = plot_kmeans_spatial_maps(meta, labels_df, k_values=[2], ncols=1)
-    fig5, _ = plot_significant_diversity_maps(meta[["x", "y"]], pvals, ncols=2)
-    ax6 = plot_gene_effect_volcano(results_df)
+    ax4 = plot_gene_effect_volcano(results_df)
 
-    assert ax1 is not None and ax2 is not None and ax3 is not None and ax6 is not None
-    assert fig4 is not None and fig5 is not None
+    assert ax1 is not None and ax2 is not None and ax3 is not None and ax4 is not None

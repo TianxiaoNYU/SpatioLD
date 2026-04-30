@@ -15,6 +15,7 @@ from .diversity import compute_local_diversity_multi_radius
 from .pipeline import (
     align_expression_and_metadata,
     compute_hvg_scanpy,
+    compute_sample_vs_null_summary_from_permutation_means,
     fit_all_genes,
     fit_joint_gene_radius_model,
     fit_single_gene_radius_model,
@@ -260,6 +261,7 @@ def _write_args_snapshot(
     radii: list[float],
     *,
     permutation_enabled: bool,
+    gene_model_enabled: bool,
 ) -> None:
     payload = vars(args).copy()
     payload["radii"] = radii
@@ -268,10 +270,54 @@ def _write_args_snapshot(
     payload["input_h5ad"] = str(args.input_h5ad) if getattr(args, "input_h5ad", None) is not None else None
     payload["output_dir"] = str(args.output_dir)
     payload["permutation_enabled"] = permutation_enabled
+    payload["gene_model_enabled"] = gene_model_enabled
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2))
 
 
-def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
+def _standardize_metadata_columns(
+    metadata_df: pd.DataFrame,
+    *,
+    x_col: str,
+    y_col: str,
+    cell_type_col: str | None,
+) -> pd.DataFrame:
+    meta_obj = metadata_df.copy()
+    rename_cols = {}
+
+    if x_col != "x":
+        if "x" in meta_obj.columns:
+            meta_obj = meta_obj.drop(columns=["x"])
+        rename_cols[x_col] = "x"
+    if y_col != "y":
+        if "y" in meta_obj.columns:
+            meta_obj = meta_obj.drop(columns=["y"])
+        rename_cols[y_col] = "y"
+    if cell_type_col is not None and cell_type_col != "cell_type":
+        if "cell_type" in meta_obj.columns:
+            meta_obj = meta_obj.drop(columns=["cell_type"])
+        rename_cols[cell_type_col] = "cell_type"
+
+    if rename_cols:
+        meta_obj = meta_obj.rename(columns=rename_cols)
+    return meta_obj
+
+
+def _prepare_output_metadata(metadata_df: pd.DataFrame) -> pd.DataFrame:
+    output_meta = metadata_df.copy()
+    output_meta.index = output_meta.index.astype(str)
+    index_name = output_meta.index.name if output_meta.index.name is not None else "index"
+    output_meta = output_meta.reset_index()
+    if "cell_id" in output_meta.columns and index_name != "cell_id":
+        output_meta = output_meta.rename(columns={"cell_id": "cell_id_metadata"})
+    output_meta = output_meta.rename(columns={index_name: "cell_id"})
+    return output_meta
+
+
+def _add_common_pipeline_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_gene_model_mode: bool = True,
+) -> None:
     parser.add_argument(
         "--metadata",
         type=Path,
@@ -282,7 +328,10 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         "--expression",
         type=Path,
         default=None,
-        help="Expression matrix path (.csv/.tsv/.txt/.parquet). Required unless --input-h5ad is provided.",
+        help=(
+            "Expression matrix path (.csv/.tsv/.txt/.parquet). Required unless "
+            "--input-h5ad is provided, except for metadata-only spatiold-lite runs."
+        ),
     )
     parser.add_argument(
         "--input-h5ad",
@@ -310,6 +359,34 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
         default=[str(r) for r in DEFAULT_RADII],
         help="Radii as space-separated values (e.g. --radii 30 60 90) or comma list (e.g. --radii 30,60,90).",
     )
+    parser.add_argument(
+        "--spatial-kernel",
+        type=str,
+        choices=["indicator", "gaussian"],
+        default="indicator",
+        help=(
+            "Spatial weighting kernel for local diversity. `indicator` reproduces the "
+            "legacy fixed-radius score, while `gaussian` uses distance weights "
+            "exp(-0.5 * (d / r)^2)."
+        ),
+    )
+    parser.add_argument(
+        "--kernel-support",
+        type=float,
+        default=1.0,
+        help=(
+            "Optional support multiplier for kernel evaluation. For example, "
+            "`--spatial-kernel gaussian --kernel-support 3` keeps weights only within "
+            "3 * radius. Default is 1 so weighted diversity uses the same fixed "
+            "neighborhood as the legacy radius mode. Pass `inf` for the exact full "
+            "Gaussian graph."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-self",
+        action="store_true",
+        help="Exclude the focal cell from its own neighborhood so the score uses w_ii = 0.",
+    )
 
     parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
@@ -321,48 +398,60 @@ def _add_common_pipeline_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-genes-per-cell", type=int, default=50, help="Cell filter: minimum nonzero genes per cell.")
     parser.add_argument("--n-model-genes", type=int, default=1000, help="Top variable genes used for regression and SVG ranking.")
 
-    parser.add_argument("--k-values", nargs="+", type=int, default=[2, 3, 4, 5], help="K values for local-diversity profile clustering.")
     parser.add_argument("--svg-k", type=int, default=15, help="kNN size for Moran's I SVG score.")
 
     parser.add_argument("--radius-mode", type=str, choices=["spline", "poly"], default="spline", help="Radius basis mode for gene model.")
     parser.add_argument("--poly-degree", type=int, default=3, help="Polynomial degree when `--radius-mode poly`.")
     parser.add_argument("--n-radius-knots", type=int, default=5, help="Spline knots when `--radius-mode spline`.")
     parser.add_argument("--spline-degree", type=int, default=3, help="Spline degree when `--radius-mode spline`.")
-    parser.add_argument(
-        "--gene-model-mode",
-        type=str,
-        choices=["single", "joint"],
-        default="single",
-        help=(
-            "Gene-modeling mode: `single` fits the existing one-gene-at-a-time pipeline, "
-            "while `joint` fits one OLS with all modeled genes entered together."
-        ),
-    )
+    if include_gene_model_mode:
+        parser.add_argument(
+            "--gene-model-mode",
+            type=str,
+            choices=["single", "joint"],
+            default="single",
+            help=(
+                "Gene-modeling mode: `single` fits the existing one-gene-at-a-time pipeline, "
+                "while `joint` fits one OLS with all modeled genes entered together."
+            ),
+        )
     parser.add_argument(
         "--regression-normalize-by",
         type=float,
         default=None,
-        help="Optional fixed divisor for local-diversity response before gene modeling. If omitted, global entropy normalization is used.",
+        help="Optional fixed divisor for the regression response when modeling a raw local-diversity matrix.",
     )
     parser.add_argument(
         "--no-regression-entropy-normalize",
         action="store_true",
-        help="Disable default global-entropy normalization of local-diversity response in gene modeling.",
+        help="Deprecated compatibility flag. Global-entropy normalization is no longer the default.",
     )
     parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run full SpatioLD pipeline (including permutation inference)."
-    )
-    _add_common_pipeline_arguments(parser)
+def _resolve_spatial_weighting_args(args: argparse.Namespace) -> tuple[bool, str, float | None]:
+    include_self = not bool(getattr(args, "exclude_self", False))
+    kernel = str(getattr(args, "spatial_kernel", "indicator"))
+    kernel_support = getattr(args, "kernel_support", None)
+    return include_self, kernel, kernel_support
+
+
+def _add_permutation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--n-perm",
         type=int,
         default=5,
         help="Permutation count for p-values and null summaries. The default assumes pooled null p-values.",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=4,
+        help=(
+            "Number of worker processes for permutations. Default is 4, which is "
+            "safer on laptops with large samples. Use -1 to use nearly all cores."
+        ),
     )
     parser.add_argument(
         "--pval-pooling",
@@ -376,18 +465,36 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
-    parser.add_argument("--alpha", type=float, default=0.05, help="Significance alpha for p-value mask.")
     parser.add_argument("--save-permutation-distribution", action="store_true", help="Also save full permutation distribution to `.npz`.")
+
+
+def _build_pipeline_parser(
+    description: str,
+    *,
+    include_gene_model_mode: bool = True,
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=description
+    )
+    _add_common_pipeline_arguments(
+        parser,
+        include_gene_model_mode=include_gene_model_mode,
+    )
+    _add_permutation_arguments(parser)
     return parser
 
 
-def build_slim_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run SpatioLD pipeline in slim mode (skip permutation inference; keep all non-permutation steps)."
-        )
+def build_parser() -> argparse.ArgumentParser:
+    return _build_pipeline_parser(
+        "Run full SpatioLD pipeline (including permutation inference)."
     )
-    _add_common_pipeline_arguments(parser)
+
+
+def build_no_gene_model_parser() -> argparse.ArgumentParser:
+    parser = _build_pipeline_parser(
+        "Run SpatioLD pipeline without fitting the gene-radius model.",
+        include_gene_model_mode=False,
+    )
     return parser
 
 
@@ -433,6 +540,34 @@ def build_cluster_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=[str(r) for r in DEFAULT_RADII],
         help="Radii as space-separated values (e.g. --radii 30 60 90) or comma list (e.g. --radii 30,60,90).",
+    )
+    parser.add_argument(
+        "--spatial-kernel",
+        type=str,
+        choices=["indicator", "gaussian"],
+        default="indicator",
+        help=(
+            "Spatial weighting kernel for local diversity. `indicator` reproduces the "
+            "legacy fixed-radius score, while `gaussian` uses distance weights "
+            "exp(-0.5 * (d / r)^2)."
+        ),
+    )
+    parser.add_argument(
+        "--kernel-support",
+        type=float,
+        default=1.0,
+        help=(
+            "Optional support multiplier for kernel evaluation. For example, "
+            "`--spatial-kernel gaussian --kernel-support 3` keeps weights only within "
+            "3 * radius. Default is 1 so weighted diversity uses the same fixed "
+            "neighborhood as the legacy radius mode. Pass `inf` for the exact full "
+            "Gaussian graph."
+        ),
+    )
+    parser.add_argument(
+        "--exclude-self",
+        action="store_true",
+        help="Exclude the focal cell from its own neighborhood so the score uses w_ii = 0.",
     )
     parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
@@ -480,12 +615,12 @@ def build_cluster_parser() -> argparse.ArgumentParser:
         "--regression-normalize-by",
         type=float,
         default=None,
-        help="Optional fixed divisor for local-diversity response before modeling. If omitted, global entropy normalization is used.",
+        help="Optional fixed divisor for the regression response when modeling a raw local-diversity matrix.",
     )
     parser.add_argument(
         "--no-regression-entropy-normalize",
         action="store_true",
-        help="Disable default global-entropy normalization of local-diversity response in modeling.",
+        help="Deprecated compatibility flag. Global-entropy normalization is no longer the default.",
     )
     parser.add_argument("--no-cluster-robust", action="store_true", help="Disable cluster-robust standard errors in gene model.")
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
@@ -643,10 +778,245 @@ def _fit_gene_model_for_pipeline(
     raise ValueError(f"Unsupported gene model mode: {gene_model_mode}")
 
 
-def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) -> None:
+def _run_metadata_only_lite_pipeline(
+    args: argparse.Namespace,
+    *,
+    skip_permutation: bool = False,
+) -> None:
+    """Run the lite workflow from metadata only.
+
+    The lite workflow needs coordinates and labels for local diversity,
+    permutation inference, and slide-level cell-type/radius modeling. Expression
+    is only needed for gene-level outputs, which are intentionally skipped here.
+    """
     radii = _parse_radii(args.radii)
+    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.metadata is None:
+        raise ValueError("Metadata-only spatiold-lite requires --metadata.")
+    if args.metadata.suffix.lower() == ".h5ad":
+        raise ValueError(
+            "Use --input-h5ad for AnnData inputs. Metadata-only mode expects a "
+            "table supplied with --metadata."
+        )
+
+    meta_raw = _load_metadata(
+        args.metadata,
+        cell_id_col=args.cell_id_col,
+        x_col=args.x_col,
+        y_col=args.y_col,
+        cell_type_col=args.cell_type_col,
+    )
+    metadata_source = str(args.metadata)
+
+    meta_obj = _standardize_metadata_columns(
+        meta_raw,
+        x_col=args.x_col,
+        y_col=args.y_col,
+        cell_type_col=args.cell_type_col,
+    )
+    metadata_output_df = _prepare_output_metadata(meta_obj)
+
+    adata = ad.AnnData(
+        X=np.empty((meta_obj.shape[0], 0)),
+        obs=meta_obj,
+        var=pd.DataFrame(index=pd.Index([], dtype=str)),
+    )
+    adata.obs_names = meta_obj.index.astype(str)
+
+    obj = SpatioLD.from_anndata(
+        adata,
+        label_key="cell_type",
+        coord_keys=("x", "y"),
+    )
+
+    ld_key = "spatiold_local_diversity"
+    pval_mixing_key = "spatiold_local_diversity_pvals_mixing"
+    pval_segregation_key = "spatiold_local_diversity_pvals_segregation"
+    pval_two_sided_key = "spatiold_local_diversity_pvals_two_sided"
+    perm_mean_key = "spatiold_local_diversity_perm_mean"
+    perm_std_key = "spatiold_local_diversity_perm_std"
+    zscore_key = "spatiold_local_diversity_zscore"
+
+    ld_df = obj.compute_local_diversity(
+        radii=radii,
+        include_self=include_self,
+        kernel=spatial_kernel,
+        kernel_support=kernel_support,
+        key=ld_key,
+    )
+    summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
+
+    if skip_permutation:
+        pvals_mixing_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        pvals_segregation_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        pvals_two_sided_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        perm_mean_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        perm_std_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        ld_df_normalized = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        summary_null = _build_sample_only_null_summary(ld_df)
+        perm_dist = None
+        response_key = ld_key
+        response_standardization = "raw-no-permutation"
+    else:
+        save_perm_distribution = bool(getattr(args, "save_permutation_distribution", False))
+        n_jobs = int(getattr(args, "n_jobs", 1))
+        perm_stats = obj.compute_permutation_stats(
+            n_perm=args.n_perm,
+            radii=radii,
+            random_state=args.random_state,
+            n_jobs=n_jobs,
+            include_self=include_self,
+            kernel=spatial_kernel,
+            kernel_support=kernel_support,
+            return_distribution=save_perm_distribution,
+            return_permutation_means=not save_perm_distribution,
+            store=True,
+            mixing_pvals_key=pval_mixing_key,
+            segregation_pvals_key=pval_segregation_key,
+            two_sided_pvals_key=pval_two_sided_key,
+            perm_mean_key=perm_mean_key,
+            perm_std_key=perm_std_key,
+            zscore_key=zscore_key,
+            pval_pooling=args.pval_pooling,
+        )
+        pvals_mixing_df = perm_stats["pvals_mixing"]
+        pvals_segregation_df = perm_stats["pvals_segregation"]
+        pvals_two_sided_df = perm_stats["pvals_two_sided"]
+        perm_mean_df = perm_stats["perm_mean"]
+        perm_std_df = perm_stats["perm_std"]
+        ld_df_normalized = perm_stats["zscore"]
+        perm_dist = perm_stats["distribution"]
+        if save_perm_distribution:
+            if perm_dist is None:
+                raise RuntimeError("Missing permutation distribution requested for output.")
+            summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
+        else:
+            perm_means = perm_stats.get("permutation_means")
+            if perm_means is None:
+                raise RuntimeError("Missing per-permutation radius means for null summary.")
+            summary_null = compute_sample_vs_null_summary_from_permutation_means(ld_df, perm_means)
+        response_key = zscore_key
+        response_standardization = "matched-null-zscore"
+
+    shared = obj.prepare_shared_components(
+        local_diversity_key=response_key,
+        radius_mode=args.radius_mode,
+        poly_degree=args.poly_degree,
+        n_radius_knots=args.n_radius_knots,
+        spline_degree=args.spline_degree,
+        covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
+    )
+    slide_ct_fit = fit_slide_level_cell_type_radius_model(
+        shared,
+        cluster_robust=not args.no_cluster_robust,
+    )
+    slide_ct_terms_df = summarize_model_terms(slide_ct_fit)
+    slide_ct_effects_df = summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
+
+    metadata_output_df.to_csv(output_dir / "metadata.csv", index=False)
+    ld_df.to_csv(output_dir / "local_diversity.csv")
+    ld_df_normalized.to_csv(output_dir / "local_diversity_normalized.csv")
+    pvals_mixing_df.to_csv(output_dir / "local_diversity_pvals_mixing.csv")
+    pvals_segregation_df.to_csv(output_dir / "local_diversity_pvals_segregation.csv")
+    pvals_two_sided_df.to_csv(output_dir / "local_diversity_pvals_two_sided.csv")
+    perm_mean_df.to_csv(output_dir / "local_diversity_perm_mean.csv")
+    perm_std_df.to_csv(output_dir / "local_diversity_perm_std.csv")
+    summary_ct.to_csv(output_dir / "summary_by_cell_type.csv", index=False)
+    summary_null.to_csv(output_dir / "summary_sample_vs_null.csv", index=False)
+    slide_ct_terms_df.to_csv(output_dir / "slide_cell_type_radius_model_terms.csv", index=False)
+    slide_ct_effects_df.to_csv(output_dir / "slide_cell_type_effects.csv", index=False)
+
+    stale_output_names = [
+        "gene_radius_model_results.csv",
+        "gene_radius_model_terms.csv",
+        "svg_morans_i.csv",
+        "local_diversity_perm_mean_normalized.csv",
+        "local_diversity_pvals.csv",
+        "cluster_labels.csv",
+        "significance_mask.csv",
+    ]
+    for output_name in stale_output_names:
+        output_path = output_dir / output_name
+        if output_path.exists():
+            output_path.unlink()
+
+    if (not skip_permutation) and getattr(args, "save_permutation_distribution", False):
+        np.savez_compressed(output_dir / "permutation_distribution.npz", permutation_distribution=perm_dist)
+
+    _write_args_snapshot(
+        args,
+        output_dir,
+        radii,
+        permutation_enabled=not skip_permutation,
+        gene_model_enabled=False,
+    )
+
+    summary_payload = {
+        "metadata_only_input": True,
+        "n_cells": int(meta_obj.shape[0]),
+        "n_genes_after_filter": 0,
+        "n_model_genes": 0,
+        "n_svg_genes": 0,
+        "n_cell_types": int(len(shared["cell_type_levels"])),
+        "reference_cell_type": str(shared["reference_cell_type"]),
+        "response_normalization_factor": shared["response_normalization_factor"],
+        "response_standardization": response_standardization,
+        "covariate_cols": shared.get("covariate_cols", []),
+        "gene_model_enabled": False,
+        "svg_enabled": False,
+        "gene_model_mode": None,
+        "n_radii": int(len(radii)),
+        "radii": radii,
+        "permutation_enabled": not skip_permutation,
+        "n_perm": int(args.n_perm) if not skip_permutation else 0,
+        "n_jobs": int(getattr(args, "n_jobs", 1)) if not skip_permutation else 0,
+        "pval_pooling": getattr(args, "pval_pooling", None) if not skip_permutation else None,
+    }
+    (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
+
+    if not args.quiet:
+        mode_parts = ["metadata-only lite"]
+        if skip_permutation:
+            mode_parts.append("permutation skipped")
+        print("SpatioLD pipeline complete.")
+        print(f"Mode: {'; '.join(mode_parts)}")
+        print(f"Metadata: {metadata_source}")
+        print("Expression: not used")
+        print(f"Output dir: {output_dir}")
+        print(f"Cells used: {meta_obj.shape[0]}")
+        print("Genes after filter: 0")
+        print("SVG: skipped")
+        print("Gene model: skipped")
+        print(f"Radii: {radii}")
+        if not skip_permutation:
+            print(f"Permutation workers: {int(getattr(args, 'n_jobs', 1))}")
+            print(f"P-value pooling: {args.pval_pooling}")
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    *,
+    skip_permutation: bool = False,
+    skip_gene_model: bool = False,
+    skip_svg: bool = False,
+) -> None:
+    radii = _parse_radii(args.radii)
+    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
+    gene_model_mode = str(getattr(args, "gene_model_mode", "single"))
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if (
+        skip_gene_model
+        and skip_svg
+        and args.expression is None
+        and args.input_h5ad is None
+    ):
+        _run_metadata_only_lite_pipeline(args, skip_permutation=skip_permutation)
+        return
 
     meta_raw, expr, metadata_source, expression_source = _load_input_tables(
         metadata_path=args.metadata,
@@ -669,19 +1039,13 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     if expr_aligned.empty or meta_aligned.empty:
         raise ValueError("No overlapping cells found between metadata and expression after filtering/alignment.")
 
-    meta_obj = meta_aligned.copy()
-    rename_cols = {}
-    if args.x_col != "x":
-        rename_cols[args.x_col] = "x"
-    if args.y_col != "y":
-        rename_cols[args.y_col] = "y"
-    if args.cell_type_col != "cell_type":
-        # check if "cell_type" is present before trying to rename to avoid accidental overwriting; if so, drop the old "cell_type" to avoid confusion
-        if "cell_type" in meta_obj.columns:
-            meta_obj = meta_obj.drop(columns=["cell_type"])
-        rename_cols[args.cell_type_col] = "cell_type"
-    if rename_cols:
-        meta_obj = meta_obj.rename(columns=rename_cols)
+    meta_obj = _standardize_metadata_columns(
+        meta_aligned,
+        x_col=args.x_col,
+        y_col=args.y_col,
+        cell_type_col=args.cell_type_col,
+    )
+    metadata_output_df = _prepare_output_metadata(meta_obj)
 
     adata = ad.AnnData(
         X=expr_aligned.values,
@@ -697,50 +1061,81 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     )
 
     ld_key = "spatiold_local_diversity"
-    pval_key = "spatiold_local_diversity_pvals"
+    pval_mixing_key = "spatiold_local_diversity_pvals_mixing"
+    pval_segregation_key = "spatiold_local_diversity_pvals_segregation"
+    pval_two_sided_key = "spatiold_local_diversity_pvals_two_sided"
     perm_mean_key = "spatiold_local_diversity_perm_mean"
+    perm_std_key = "spatiold_local_diversity_perm_std"
+    zscore_key = "spatiold_local_diversity_zscore"
 
-    ld_df = obj.compute_local_diversity(radii=radii, key=ld_key)
-    global_entropy = obj.compute_global_entropy()
-    ld_df_normalized = ld_df / global_entropy if global_entropy > 0 else ld_df
+    ld_df = obj.compute_local_diversity(
+        radii=radii,
+        include_self=include_self,
+        kernel=spatial_kernel,
+        kernel_support=kernel_support,
+        key=ld_key,
+    )
     summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
-    cluster_labels_df, _ = obj.cluster_local_diversity_profiles(local_diversity_key=ld_key, k_values=args.k_values)
 
     if skip_permutation:
-        pvals_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        pvals_mixing_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        pvals_segregation_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        pvals_two_sided_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         perm_mean_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
-        perm_mean_df_norm = perm_mean_df.copy()
+        perm_std_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
+        ld_df_normalized = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         summary_null = _build_sample_only_null_summary(ld_df)
-        sig_mask_df = pd.DataFrame(0, index=ld_df.index, columns=ld_df.columns, dtype=int)
         perm_dist = None
+        response_key = ld_key
+        response_standardization = "raw-no-permutation"
     else:
+        save_perm_distribution = bool(getattr(args, "save_permutation_distribution", False))
+        n_jobs = int(getattr(args, "n_jobs", 1))
         perm_stats = obj.compute_permutation_stats(
             n_perm=args.n_perm,
             radii=radii,
             random_state=args.random_state,
-            n_jobs=-1,
+            n_jobs=n_jobs,
+            include_self=include_self,
+            kernel=spatial_kernel,
+            kernel_support=kernel_support,
+            return_distribution=save_perm_distribution,
+            return_permutation_means=not save_perm_distribution,
             store=True,
-            pvals_key=pval_key,
+            mixing_pvals_key=pval_mixing_key,
+            segregation_pvals_key=pval_segregation_key,
+            two_sided_pvals_key=pval_two_sided_key,
             perm_mean_key=perm_mean_key,
-            alternative="greater",
+            perm_std_key=perm_std_key,
+            zscore_key=zscore_key,
             pval_pooling=args.pval_pooling,
         )
-        pvals_df = perm_stats["pvals"]
+        pvals_mixing_df = perm_stats["pvals_mixing"]
+        pvals_segregation_df = perm_stats["pvals_segregation"]
+        pvals_two_sided_df = perm_stats["pvals_two_sided"]
         perm_mean_df = perm_stats["perm_mean"]
-        perm_mean_df_norm = perm_mean_df / global_entropy if global_entropy > 0 else perm_mean_df
+        perm_std_df = perm_stats["perm_std"]
+        ld_df_normalized = perm_stats["zscore"]
         perm_dist = perm_stats["distribution"]
-        summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
-        sig_mask_df = obj.build_significance_mask(pvals_key=pval_key, alpha=args.alpha)
+        if save_perm_distribution:
+            if perm_dist is None:
+                raise RuntimeError("Missing permutation distribution requested for output.")
+            summary_null = obj.compute_sample_vs_null_summary(perm_dist, local_diversity_key=ld_key)
+        else:
+            perm_means = perm_stats.get("permutation_means")
+            if perm_means is None:
+                raise RuntimeError("Missing per-permutation radius means for null summary.")
+            summary_null = compute_sample_vs_null_summary_from_permutation_means(ld_df, perm_means)
+        response_key = zscore_key
+        response_standardization = "matched-null-zscore"
 
     shared = obj.prepare_shared_components(
-        local_diversity_key=ld_key,
+        local_diversity_key=response_key,
         radius_mode=args.radius_mode,
         poly_degree=args.poly_degree,
         n_radius_knots=args.n_radius_knots,
         spline_degree=args.spline_degree,
         covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
-        normalize_by=args.regression_normalize_by,
-        normalize_by_global_entropy=not args.no_regression_entropy_normalize,
     )
     slide_ct_fit = fit_slide_level_cell_type_radius_model(
         shared,
@@ -749,86 +1144,142 @@ def run_pipeline(args: argparse.Namespace, *, skip_permutation: bool = False) ->
     slide_ct_terms_df = summarize_model_terms(slide_ct_fit)
     slide_ct_effects_df = summarize_slide_level_cell_type_effects(slide_ct_fit, shared)
 
-    n_model_genes = max(1, min(int(args.n_model_genes), expr_aligned.shape[1]))
-    # var_rank = expr_aligned.var(axis=0).sort_values(ascending=False)
-    # model_genes = var_rank.head(n_model_genes).index
-    hvg_df = _select_hvg_with_fallback(
-        expr_aligned,
-        n_top_hvg=n_model_genes,
-        hvg_flavor="seurat",
-        quiet=args.quiet,
-    )
-    hvg_genes = hvg_df.index.astype(str).tolist()
-    expr_model = expr_aligned.loc[:, hvg_genes].copy()
+    expr_model: pd.DataFrame | None = None
+    if not (skip_gene_model and skip_svg):
+        n_model_genes = max(1, min(int(args.n_model_genes), expr_aligned.shape[1]))
+        hvg_df = _select_hvg_with_fallback(
+            expr_aligned,
+            n_top_hvg=n_model_genes,
+            hvg_flavor="seurat",
+            quiet=args.quiet,
+        )
+        hvg_genes = hvg_df.index.astype(str).tolist()
+        expr_model = expr_aligned.loc[:, hvg_genes].copy()
 
-    results_df, gene_model_terms_df = _fit_gene_model_for_pipeline(
-        expr_model,
-        shared,
-        gene_model_mode=args.gene_model_mode,
-        cluster_robust=not args.no_cluster_robust,
-        quiet=args.quiet,
-    )
-    svg_df = obj.compute_svg_morans_i(expr_model, k=args.svg_k)
+    if skip_gene_model:
+        results_df = None
+        gene_model_terms_df = None
+    else:
+        if expr_model is None:
+            raise RuntimeError("Gene-model expression matrix was not prepared.")
+        results_df, gene_model_terms_df = _fit_gene_model_for_pipeline(
+            expr_model,
+            shared,
+            gene_model_mode=gene_model_mode,
+            cluster_robust=not args.no_cluster_robust,
+            quiet=args.quiet,
+        )
+    if skip_svg:
+        svg_df = None
+    else:
+        if expr_model is None:
+            raise RuntimeError("SVG expression matrix was not prepared.")
+        svg_df = obj.compute_svg_morans_i(expr_model, k=args.svg_k)
 
+    metadata_output_df.to_csv(output_dir / "metadata.csv", index=False)
     ld_df.to_csv(output_dir / "local_diversity.csv")
     ld_df_normalized.to_csv(output_dir / "local_diversity_normalized.csv")
-    pvals_df.to_csv(output_dir / "local_diversity_pvals.csv")
+    pvals_mixing_df.to_csv(output_dir / "local_diversity_pvals_mixing.csv")
+    pvals_segregation_df.to_csv(output_dir / "local_diversity_pvals_segregation.csv")
+    pvals_two_sided_df.to_csv(output_dir / "local_diversity_pvals_two_sided.csv")
     perm_mean_df.to_csv(output_dir / "local_diversity_perm_mean.csv")
-    perm_mean_df_norm.to_csv(output_dir / "local_diversity_perm_mean_normalized.csv")
+    perm_std_df.to_csv(output_dir / "local_diversity_perm_std.csv")
     summary_ct.to_csv(output_dir / "summary_by_cell_type.csv", index=False)
     summary_null.to_csv(output_dir / "summary_sample_vs_null.csv", index=False)
-    cluster_labels_df.to_csv(output_dir / "cluster_labels.csv")
-    sig_mask_df.to_csv(output_dir / "significance_mask.csv")
     slide_ct_terms_df.to_csv(output_dir / "slide_cell_type_radius_model_terms.csv", index=False)
     slide_ct_effects_df.to_csv(output_dir / "slide_cell_type_effects.csv", index=False)
-    results_df.to_csv(output_dir / "gene_radius_model_results.csv", index=False)
+    gene_model_results_path = output_dir / "gene_radius_model_results.csv"
+    if results_df is not None:
+        results_df.to_csv(gene_model_results_path, index=False)
+    elif gene_model_results_path.exists():
+        gene_model_results_path.unlink()
     gene_model_terms_path = output_dir / "gene_radius_model_terms.csv"
     if gene_model_terms_df is not None:
         gene_model_terms_df.to_csv(gene_model_terms_path, index=False)
     elif gene_model_terms_path.exists():
         gene_model_terms_path.unlink()
-    svg_df.to_csv(output_dir / "svg_morans_i.csv", index=False)
+    old_perm_norm_path = output_dir / "local_diversity_perm_mean_normalized.csv"
+    if old_perm_norm_path.exists():
+        old_perm_norm_path.unlink()
+    old_pvals_path = output_dir / "local_diversity_pvals.csv"
+    if old_pvals_path.exists():
+        old_pvals_path.unlink()
+    old_cluster_labels_path = output_dir / "cluster_labels.csv"
+    if old_cluster_labels_path.exists():
+        old_cluster_labels_path.unlink()
+    old_sig_mask_path = output_dir / "significance_mask.csv"
+    if old_sig_mask_path.exists():
+        old_sig_mask_path.unlink()
+    svg_path = output_dir / "svg_morans_i.csv"
+    if svg_df is not None:
+        svg_df.to_csv(svg_path, index=False)
+    elif svg_path.exists():
+        svg_path.unlink()
 
     if (not skip_permutation) and getattr(args, "save_permutation_distribution", False):
         np.savez_compressed(output_dir / "permutation_distribution.npz", permutation_distribution=perm_dist)
 
-    _write_args_snapshot(args, output_dir, radii, permutation_enabled=not skip_permutation)
+    _write_args_snapshot(
+        args,
+        output_dir,
+        radii,
+        permutation_enabled=not skip_permutation,
+        gene_model_enabled=not skip_gene_model,
+    )
 
     summary_payload = {
         "n_cells": int(expr_aligned.shape[0]),
         "n_genes_after_filter": int(expr_aligned.shape[1]),
-        "n_model_genes": int(expr_model.shape[1]),
+        "n_model_genes": 0 if skip_gene_model else int(expr_model.shape[1]),
+        "n_svg_genes": 0 if skip_svg else int(expr_model.shape[1]),
         "n_cell_types": int(len(shared["cell_type_levels"])),
         "reference_cell_type": str(shared["reference_cell_type"]),
         "response_normalization_factor": shared["response_normalization_factor"],
+        "response_standardization": response_standardization,
         "covariate_cols": shared.get("covariate_cols", []),
-        "gene_model_mode": str(args.gene_model_mode),
+        "gene_model_enabled": not skip_gene_model,
+        "svg_enabled": not skip_svg,
+        "gene_model_mode": gene_model_mode if not skip_gene_model else None,
         "n_radii": int(len(radii)),
         "radii": radii,
         "permutation_enabled": not skip_permutation,
         "n_perm": int(args.n_perm) if not skip_permutation else 0,
+        "n_jobs": int(getattr(args, "n_jobs", 1)) if not skip_permutation else 0,
         "pval_pooling": getattr(args, "pval_pooling", None) if not skip_permutation else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
 
     if not args.quiet:
-        mode = "full" if not skip_permutation else "slim (permutation skipped)"
+        mode_parts = ["full" if not skip_permutation else "permutation skipped"]
+        if skip_gene_model:
+            mode_parts.append("gene model skipped")
+        if skip_svg:
+            mode_parts.append("SVG skipped")
         print("SpatioLD pipeline complete.")
-        print(f"Mode: {mode}")
+        print(f"Mode: {'; '.join(mode_parts)}")
         print(f"Metadata: {metadata_source}")
         print(f"Expression: {expression_source}")
         print(f"Output dir: {output_dir}")
         print(f"Cells used: {expr_aligned.shape[0]}")
         print(f"Genes after filter: {expr_aligned.shape[1]}")
-        print(f"Modeled genes: {expr_model.shape[1]}")
-        print(f"Gene model mode: {args.gene_model_mode}")
+        if skip_svg:
+            print("SVG: skipped")
+        else:
+            print(f"SVG genes: {expr_model.shape[1]}")
+        if skip_gene_model:
+            print("Gene model: skipped")
+        else:
+            print(f"Modeled genes: {expr_model.shape[1]}")
+            print(f"Gene model mode: {gene_model_mode}")
         print(f"Radii: {radii}")
         if not skip_permutation:
+            print(f"Permutation workers: {int(getattr(args, 'n_jobs', 1))}")
             print(f"P-value pooling: {args.pval_pooling}")
 
 
 def run_cluster_pipeline(args: argparse.Namespace) -> None:
     radii = _parse_radii(args.radii)
+    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -852,6 +1303,14 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
     expr_aligned, meta_aligned = align_expression_and_metadata(expr_filt, meta_raw)
     if expr_aligned.empty or meta_aligned.empty:
         raise ValueError("No overlapping cells found between metadata and expression after filtering/alignment.")
+    metadata_output_df = _prepare_output_metadata(
+        _standardize_metadata_columns(
+            meta_aligned,
+            x_col=args.x_col,
+            y_col=args.y_col,
+            cell_type_col=None,
+        )
+    )
 
     simplify = bool(getattr(args, "simplify", False))
     min_hvg_target = 1 if simplify else 2
@@ -881,6 +1340,9 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             coords_df.loc[cluster_labels.index],
             cluster_labels,
             radii=radii,
+            include_self=include_self,
+            kernel=spatial_kernel,
+            kernel_support=kernel_support,
         )
         cluster_meta = pd.DataFrame({"cluster_label": cluster_labels})
         if args.cell_size_col is not None:
@@ -899,7 +1361,6 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             spline_degree=args.spline_degree,
             covariate_cols=[args.cell_size_col] if args.cell_size_col is not None else None,
             normalize_by=args.regression_normalize_by,
-            normalize_by_global_entropy=not args.no_regression_entropy_normalize,
         )
 
     if simplify:
@@ -987,7 +1448,14 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
     results_df.to_csv(output_dir / "cluster_gene_ld_model_results.csv", index=False)
     hvg_out.to_csv(output_dir / "hvg_selected.csv", index=False)
     cluster_meta_by_gene_df.to_csv(output_dir / "cluster_meta_by_gene.csv")
-    _write_args_snapshot(args, output_dir, radii, permutation_enabled=False)
+    metadata_output_df.to_csv(output_dir / "metadata.csv", index=False)
+    _write_args_snapshot(
+        args,
+        output_dir,
+        radii,
+        permutation_enabled=False,
+        gene_model_enabled=True,
+    )
 
     summary_payload = {
         "workflow": "cluster_ld_simplified_single_clustering" if simplify else "cluster_ld_leave_one_gene_out",
@@ -1029,10 +1497,10 @@ def main() -> None:
     run_pipeline(args)
 
 
-def main_slim() -> None:
-    parser = build_slim_parser()
+def main_no_gene_model() -> None:
+    parser = build_no_gene_model_parser()
     args = parser.parse_args()
-    run_pipeline(args, skip_permutation=True)
+    run_pipeline(args, skip_gene_model=True, skip_svg=True)
 
 
 def main_cluster() -> None:

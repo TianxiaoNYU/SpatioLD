@@ -33,12 +33,18 @@ perm_stats = sld.compute_nd_permutation_stats(
     n_jobs=1,
     pval_pooling="neighborhood_size",
 )
-pval_df = perm_stats["pvals"]
+pvals_mixing_df = perm_stats["pvals_mixing"]
+pvals_segregation_df = perm_stats["pvals_segregation"]
+pvals_two_sided_df = perm_stats["pvals_two_sided"]
 perm_mean_df = perm_stats["perm_mean"]
 perm_dist = perm_stats["distribution"]
 
-print("\nPermutation p-values:")
-print(pval_df.round(3))
+print("\nPermutation mixing p-values:")
+print(pvals_mixing_df.round(3))
+print("\nPermutation segregation p-values:")
+print(pvals_segregation_df.round(3))
+print("\nPermutation two-sided p-values:")
+print(pvals_two_sided_df.round(3))
 
 print("\nPermutation null mean:")
 print(perm_mean_df.round(3))

@@ -124,10 +124,11 @@ def main() -> None:
         random_state=args.seed,
         n_jobs=1,
         pval_pooling=args.pval_pooling,
-        pvals_key="ld_pvals",
         perm_mean_key="ld_perm_mean",
     )
-    pvals_df = perm_stats["pvals"]
+    pvals_mixing_df = perm_stats["pvals_mixing"]
+    pvals_segregation_df = perm_stats["pvals_segregation"]
+    pvals_two_sided_df = perm_stats["pvals_two_sided"]
     perm_dist = perm_stats["distribution"]
 
     entropy_global = obj.compute_global_shannon_entropy()
@@ -140,16 +141,7 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # 2) Clustering + significance map
-    # ------------------------------------------------------------------
-    cluster_labels_df, _ = obj.cluster_local_diversity_profiles(
-        local_diversity_key="ld_full",
-        k_values=(2, 3, 4),
-    )
-    sig_mask_df = obj.build_significance_mask(pvals_key="ld_pvals", alpha=0.05)
-
-    # ------------------------------------------------------------------
-    # 3) Gene-radius model + SVG
+    # 2) Gene-radius model + SVG
     # ------------------------------------------------------------------
     shared = obj.prepare_shared_components(
         local_diversity_key="ld_full",
@@ -166,7 +158,7 @@ def main() -> None:
     svg_df = obj.compute_svg_morans_i(expr_model_df, k=15)
 
     # ------------------------------------------------------------------
-    # 4) Optional plotting
+    # 3) Optional plotting
     # ------------------------------------------------------------------
     if args.plot:
         import matplotlib.pyplot as plt
@@ -174,27 +166,23 @@ def main() -> None:
         ax1 = sld.plot_spatial_cell_types(obj.metadata)
         ax2 = sld.plot_mean_diversity_by_cell_type(
             summary_ct,
-            title="Normalized Mean Local Diversity vs Radius by Cell Type",
-            ylabel="Mean Local Diversity (normalized)",
+            title="Mean Local Diversity vs Radius by Cell Type",
+            ylabel="Mean Local Diversity",
         )
         ax3 = sld.plot_sample_vs_null_curve(summary_null)
-        fig4, _ = sld.plot_kmeans_spatial_maps(obj.metadata, cluster_labels_df, k_values=[2, 3, 4], ncols=2)
-        fig5, _ = sld.plot_significant_diversity_maps(obj.get_coords_df(), pvals_df, alpha=0.05)
-        ax6 = sld.plot_gene_effect_volcano(results_df)
+        ax4 = sld.plot_gene_effect_volcano(results_df)
 
         try:
             hvg_mock = set(results_df.head(30)["gene"])
             svg_top = set(svg_df.head(30)["gene"])
             ldvg_top = set(results_df.nsmallest(30, "pval_gene")["gene"])
-            ax7 = sld.plot_gene_set_venn(hvg_mock, svg_top, ldvg_top)  # type: ignore
+            ax5 = sld.plot_gene_set_venn(hvg_mock, svg_top, ldvg_top)  # type: ignore
         except ImportError:
-            ax7 = None
+            ax5 = None
 
-        for ax in [ax1, ax2, ax3, ax6, ax7]:
+        for ax in [ax1, ax2, ax3, ax4, ax5]:
             if ax is not None:
                 ax.figure.tight_layout()
-        for fig in [fig4, fig5]:
-            fig.tight_layout()
 
         plt.close("all")
 
@@ -205,6 +193,9 @@ def main() -> None:
     print(f"Global Shannon entropy: {entropy_global:.4f}")
     print(f"P-value pooling: {args.pval_pooling}")
     print(f"LD matrix shape: {ld_df.shape}")
+    print(f"Mixing p-value matrix shape: {pvals_mixing_df.shape}")
+    print(f"Segregation p-value matrix shape: {pvals_segregation_df.shape}")
+    print(f"Two-sided p-value matrix shape: {pvals_two_sided_df.shape}")
     print(f"Regression summary rows: {results_df.shape[0]}")
     print(f"Top 5 genes by p-value: {results_df.head(5)['gene'].tolist()}")
     print(f"Top 5 SVG genes by Moran's I: {svg_df.head(5)['gene'].tolist()}")
