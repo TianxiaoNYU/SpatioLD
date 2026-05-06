@@ -14,16 +14,14 @@ from .anndata_utils import (
     obsm_matrix_to_df,
     store_matrix_in_anndata,
 )
-from .diversity import DEFAULT_RADII, compute_local_diversity_multi_radius
+from .diversity import DEFAULT_RADII, SpatialKernel, compute_local_diversity_multi_radius
 from .permutation import (
     compute_nd_permutation_distribution,
     compute_nd_permutation_mean,
-    compute_nd_permutation_pvals,
     compute_nd_permutation_stats,
+    compute_nd_permutation_std,
 )
 from .pipeline import (
-    build_significance_mask as _build_significance_mask,
-    cluster_local_diversity_profiles as _cluster_local_diversity_profiles,
     compute_global_shannon_entropy as _compute_global_shannon_entropy,
     compute_sample_vs_null_summary as _compute_sample_vs_null_summary,
     compute_svg_morans_i as _compute_svg_morans_i,
@@ -178,6 +176,8 @@ class SpatioLD:
         radii: list[float] | list[int] | tuple[float, ...] = DEFAULT_RADII,
         include_self: bool = True,
         base: float = 2.0,
+        kernel: SpatialKernel = "indicator",
+        kernel_support: float | None = None,
         store: bool = True,
         key: str = "spatiold_local_diversity",
     ) -> pd.DataFrame:
@@ -188,11 +188,13 @@ class SpatioLD:
             radii=radii,
             include_self=include_self,
             base=base,
+            kernel=kernel,
+            kernel_support=kernel_support,
         )
         if store:
             store_matrix_in_anndata(self.adata, ld_df, key=key)
         return ld_df
-    
+
     def compute_global_entropy(
         self,
         # local_diversity_key: str = "spatiold_local_diversity",
@@ -201,37 +203,6 @@ class SpatioLD:
         """Compute global Shannon entropy from stored local diversity."""
         # ld_df = self.get_result(local_diversity_key)
         return _compute_global_shannon_entropy(self.labels, base=base)
-
-    def compute_permutation_pvals(
-        self,
-        n_perm: int,
-        *,
-        radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
-        random_state: int = 42,
-        n_jobs: int | None = None,
-        include_self: bool = True,
-        base: float = 2.0,
-        alternative: str = "greater",
-        pval_pooling: str = "neighborhood_size",
-        store: bool = True,
-        key: str = "spatiold_local_diversity_pvals",
-    ) -> pd.DataFrame:
-        """Compute permutation p-values for local diversity."""
-        pval_df = compute_nd_permutation_pvals(
-            self.coords,
-            self.labels,
-            n_perm=n_perm,
-            radii=radii,
-            random_state=random_state,
-            n_jobs=n_jobs,
-            include_self=include_self,
-            base=base,
-            alternative=alternative,
-            pval_pooling=pval_pooling,
-        )
-        if store:
-            store_matrix_in_anndata(self.adata, pval_df, key=key)
-        return pval_df
 
     def compute_permutation_stats(
         self,
@@ -242,13 +213,22 @@ class SpatioLD:
         n_jobs: int | None = None,
         include_self: bool = True,
         base: float = 2.0,
-        alternative: str = "greater",
+        kernel: SpatialKernel = "indicator",
+        kernel_support: float | None = None,
         pval_pooling: str = "neighborhood_size",
+        return_distribution: bool = True,
+        return_permutation_means: bool = False,
+        return_observed: bool = False,
         store: bool = True,
-        pvals_key: str = "spatiold_local_diversity_pvals",
+        observed_key: str = "spatiold_local_diversity",
+        mixing_pvals_key: str = "spatiold_local_diversity_pvals_mixing",
+        segregation_pvals_key: str = "spatiold_local_diversity_pvals_segregation",
+        two_sided_pvals_key: str = "spatiold_local_diversity_pvals_two_sided",
         perm_mean_key: str = "spatiold_local_diversity_perm_mean",
+        perm_std_key: str = "spatiold_local_diversity_perm_std",
+        zscore_key: str = "spatiold_local_diversity_zscore",
     ) -> dict[str, pd.DataFrame | np.ndarray]:
-        """Compute p-values, null mean, and permutation distribution in one run."""
+        """Compute local p-values, matched null moments, and distribution in one run."""
         stats = compute_nd_permutation_stats(
             self.coords,
             self.labels,
@@ -258,12 +238,25 @@ class SpatioLD:
             n_jobs=n_jobs,
             include_self=include_self,
             base=base,
-            alternative=alternative,
+            kernel=kernel,
+            kernel_support=kernel_support,
             pval_pooling=pval_pooling,
+            return_distribution=return_distribution,
+            return_permutation_means=return_permutation_means,
+            return_observed=return_observed,
         )
         if store:
-            store_matrix_in_anndata(self.adata, stats["pvals"], key=pvals_key)
+            if return_observed:
+                observed = stats.get("observed")
+                if observed is None:
+                    raise RuntimeError("Missing observed local-diversity matrix.")
+                store_matrix_in_anndata(self.adata, observed, key=observed_key)
+            store_matrix_in_anndata(self.adata, stats["pvals_mixing"], key=mixing_pvals_key)
+            store_matrix_in_anndata(self.adata, stats["pvals_segregation"], key=segregation_pvals_key)
+            store_matrix_in_anndata(self.adata, stats["pvals_two_sided"], key=two_sided_pvals_key)
             store_matrix_in_anndata(self.adata, stats["perm_mean"], key=perm_mean_key)
+            store_matrix_in_anndata(self.adata, stats["perm_std"], key=perm_std_key)
+            store_matrix_in_anndata(self.adata, stats["zscore"], key=zscore_key)
         return stats
 
     def compute_permutation_mean(
@@ -275,6 +268,8 @@ class SpatioLD:
         n_jobs: int | None = None,
         include_self: bool = True,
         base: float = 2.0,
+        kernel: SpatialKernel = "indicator",
+        kernel_support: float | None = None,
         store: bool = True,
         key: str = "spatiold_local_diversity_perm_mean",
     ) -> pd.DataFrame:
@@ -288,10 +283,43 @@ class SpatioLD:
             n_jobs=n_jobs,
             include_self=include_self,
             base=base,
+            kernel=kernel,
+            kernel_support=kernel_support,
         )
         if store:
             store_matrix_in_anndata(self.adata, perm_mean_df, key=key)
         return perm_mean_df
+
+    def compute_permutation_std(
+        self,
+        n_perm: int,
+        *,
+        radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
+        random_state: int = 42,
+        n_jobs: int | None = None,
+        include_self: bool = True,
+        base: float = 2.0,
+        kernel: SpatialKernel = "indicator",
+        kernel_support: float | None = None,
+        store: bool = True,
+        key: str = "spatiold_local_diversity_perm_std",
+    ) -> pd.DataFrame:
+        """Compute matched permutation null standard deviation matrix for local diversity."""
+        perm_std_df = compute_nd_permutation_std(
+            self.coords,
+            self.labels,
+            n_perm=n_perm,
+            radii=radii,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            include_self=include_self,
+            base=base,
+            kernel=kernel,
+            kernel_support=kernel_support,
+        )
+        if store:
+            store_matrix_in_anndata(self.adata, perm_std_df, key=key)
+        return perm_std_df
 
     def compute_permutation_distribution(
         self,
@@ -302,6 +330,8 @@ class SpatioLD:
         n_jobs: int | None = None,
         include_self: bool = True,
         base: float = 2.0,
+        kernel: SpatialKernel = "indicator",
+        kernel_support: float | None = None,
     ) -> np.ndarray:
         """Compute full permutation distribution (n_perm, n_radii, n_cells)."""
         return compute_nd_permutation_distribution(
@@ -313,6 +343,8 @@ class SpatioLD:
             n_jobs=n_jobs,
             include_self=include_self,
             base=base,
+            kernel=kernel,
+            kernel_support=kernel_support,
         )
 
     def summarize_local_diversity_by_cell_type(
@@ -322,7 +354,7 @@ class SpatioLD:
         local_diversity_key: str = "spatiold_local_diversity",
         cell_type_col: str | None = None,
         normalize_by: float | None = None,
-        normalize_by_global_entropy: bool = True,
+        normalize_by_global_entropy: bool = False,
     ) -> pd.DataFrame:
         """Summarize local diversity by cell type/radius from object-held data."""
         if local_diversity_df is None:
@@ -347,7 +379,7 @@ class SpatioLD:
         local_diversity_df: pd.DataFrame | None = None,
         local_diversity_key: str = "spatiold_local_diversity",
         normalize_by: float | None = None,
-        normalize_by_global_entropy: bool = True,
+        normalize_by_global_entropy: bool = False,
         ci: tuple[float, float] = (2.5, 97.5),
     ) -> pd.DataFrame:
         """Compute sample-vs-null summary using object-held local diversity."""
@@ -365,40 +397,6 @@ class SpatioLD:
             ci=ci,
         )
 
-    def cluster_local_diversity_profiles(
-        self,
-        *,
-        local_diversity_df: pd.DataFrame | None = None,
-        local_diversity_key: str = "spatiold_local_diversity",
-        k_values: tuple[int, ...] | list[int] = (2, 3, 4, 5),
-        scale: bool = True,
-        random_state: int = 42,
-        n_init: int = 20,
-    ):
-        """Cluster local-diversity profiles using object-held local diversity."""
-        if local_diversity_df is None:
-            local_diversity_df = self.get_result(local_diversity_key)
-
-        return _cluster_local_diversity_profiles(
-            local_diversity_df,
-            k_values=k_values,
-            scale=scale,
-            random_state=random_state,
-            n_init=n_init,
-        )
-
-    def build_significance_mask(
-        self,
-        *,
-        pvals_df: pd.DataFrame | None = None,
-        pvals_key: str = "spatiold_local_diversity_pvals",
-        alpha: float = 0.05,
-    ) -> pd.DataFrame:
-        """Build binary significance mask from p-values."""
-        if pvals_df is None:
-            pvals_df = self.get_result(pvals_key)
-        return _build_significance_mask(pvals_df, alpha=alpha)
-
     def prepare_shared_components(
         self,
         *,
@@ -414,12 +412,12 @@ class SpatioLD:
         poly_degree: int = 3,
         covariate_cols: list[str] | tuple[str, ...] | None = None,
         normalize_by: float | None = None,
-        normalize_by_global_entropy: bool = True,
+        normalize_by_global_entropy: bool = False,
     ) -> dict[str, Any]:
         """Prepare shared components for gene-radius modeling using object data.
 
-        By default, local-diversity response is normalized by object-level
-        global Shannon entropy before regression.
+        By default, the response is used as provided. Full pipeline runs can
+        pass matched-null z-scores here for permutation-standardized modeling.
         """
         if response_matrix is None:
             response_df = self.get_result(local_diversity_key)
@@ -463,7 +461,7 @@ class SpatioLD:
         poly_degree: int = 3,
         covariate_cols: list[str] | tuple[str, ...] | None = None,
         normalize_by: float | None = None,
-        normalize_by_global_entropy: bool = True,
+        normalize_by_global_entropy: bool = False,
         add_intercept: bool = True,
         cluster_robust: bool = True,
     ) -> dict[str, Any]:
@@ -509,7 +507,7 @@ class SpatioLD:
         poly_degree: int = 3,
         covariate_cols: list[str] | tuple[str, ...] | None = None,
         normalize_by: float | None = None,
-        normalize_by_global_entropy: bool = True,
+        normalize_by_global_entropy: bool = False,
         add_intercept: bool = True,
         cluster_robust: bool = True,
         return_fit_object: bool = True,

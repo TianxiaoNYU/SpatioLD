@@ -29,3 +29,62 @@ def test_multi_radius_returns_dataframe_with_cell_ids() -> None:
     assert list(out.index) == ["a", "b", "c"]
     assert list(out.columns) == [0.1, 2.0]
     assert (out.values >= 0).all()
+
+
+def test_gaussian_kernel_matches_manual_weighted_entropy() -> None:
+    coords = pd.DataFrame({"x": [0.0, 0.5, 3.0], "y": [0.0, 0.0, 0.0]})
+    labels = pd.Series(["A", "A", "B"])
+
+    out = compute_local_diversity(
+        coords,
+        labels,
+        radius=1.0,
+        include_self=False,
+        kernel="gaussian",
+        kernel_support=np.inf,
+    )
+
+    w_same = np.exp(-0.5 * (0.5 / 1.0) ** 2)
+    w_far_from_first = np.exp(-0.5 * (3.0 / 1.0) ** 2)
+    p_a_first = w_same / (w_same + w_far_from_first)
+    p_b_first = w_far_from_first / (w_same + w_far_from_first)
+    expected_first = -(p_a_first * np.log2(p_a_first) + p_b_first * np.log2(p_b_first))
+
+    w_far_from_second = np.exp(-0.5 * (2.5 / 1.0) ** 2)
+    p_a_second = w_same / (w_same + w_far_from_second)
+    p_b_second = w_far_from_second / (w_same + w_far_from_second)
+    expected_second = -(p_a_second * np.log2(p_a_second) + p_b_second * np.log2(p_b_second))
+
+    assert np.isclose(out[0], expected_first)
+    assert np.isclose(out[1], expected_second)
+    assert np.isclose(out[2], 0.0)
+
+
+def test_gaussian_default_support_stays_local_and_fast() -> None:
+    coords = pd.DataFrame({"x": [0.0, 0.5, 3.0], "y": [0.0, 0.0, 0.0]})
+    labels = pd.Series(["A", "A", "B"])
+
+    out = compute_local_diversity(
+        coords,
+        labels,
+        radius=1.0,
+        include_self=False,
+        kernel="gaussian",
+    )
+
+    assert np.allclose(out, 0.0)
+
+
+def test_indicator_kernel_is_backward_compatible() -> None:
+    coords = pd.DataFrame({"x": [0.0, 0.0, 1.0], "y": [0.0, 1.0, 0.0]})
+    labels = pd.Series(["A", "A", "B"])
+
+    legacy = compute_local_diversity_multi_radius(coords, labels, radii=[0.5, 2.0])
+    explicit = compute_local_diversity_multi_radius(
+        coords,
+        labels,
+        radii=[0.5, 2.0],
+        kernel="indicator",
+    )
+
+    assert legacy.equals(explicit)

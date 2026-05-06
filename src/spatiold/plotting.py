@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -142,114 +141,6 @@ def plot_sample_vs_null_curve(
     ax.set_title("Sample vs Null Local Diversity")
     ax.legend()
     return ax
-
-
-def plot_kmeans_spatial_maps(
-    metadata_df: pd.DataFrame,
-    labels_df: pd.DataFrame,
-    *,
-    k_values: Sequence[int] | None = None,
-    x_col: str = "x",
-    y_col: str = "y",
-    ncols: int = 2,
-    palette: str = "tab10",
-    point_size: float = 3,
-):
-    """Plot spatial maps of KMeans labels for multiple `k` values."""
-    plt, sns = _get_plot_libs()
-
-    plot_df = metadata_df.copy()
-    plot_df.index = plot_df.index.astype(str)
-    labels_local = labels_df.copy()
-    labels_local.index = labels_local.index.astype(str)
-    plot_df = plot_df.join(labels_local, how="inner")
-
-    if k_values is None:
-        k_values = [int(c.split("k")[-1]) for c in labels_local.columns if c.startswith("ld_kmeans_k")]
-
-    k_values = list(k_values)
-    n_panels = len(k_values)
-    nrows = int(math.ceil(n_panels / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5 * nrows), dpi=220)
-    axes = np.atleast_1d(axes).ravel()
-
-    for i, k in enumerate(k_values):
-        ax = axes[i]
-        col = f"ld_kmeans_k{k}"
-        sns.scatterplot(
-            data=plot_df,
-            x=x_col,
-            y=y_col,
-            hue=col,
-            palette=palette,
-            s=point_size,
-            linewidth=0,
-            ax=ax,
-        )
-        ax.set_title(f"KMeans on local diversity profiles (k={k})")
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("X / microns")
-        ax.set_ylabel("Y / microns")
-        ax.legend(title="Cluster", bbox_to_anchor=(1.02, 1), loc="upper left")
-
-    for j in range(n_panels, len(axes)):
-        axes[j].axis("off")
-
-    fig.tight_layout()
-    return fig, axes
-
-
-def plot_significant_diversity_maps(
-    coords_df: pd.DataFrame,
-    pvals_df: pd.DataFrame,
-    *,
-    alpha: float = 0.05,
-    x_col: str = "x",
-    y_col: str = "y",
-    ncols: int = 4,
-    point_size: float = 3,
-):
-    """Plot binary spatial maps (significant vs non-significant) per radius."""
-    plt, _ = _get_plot_libs()
-
-    plot_df = coords_df[[x_col, y_col]].copy().join(pvals_df, how="inner")
-    radii = list(pvals_df.columns)
-
-    n_panels = len(radii)
-    nrows = int(math.ceil(n_panels / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.8 * ncols, 4.6 * nrows), dpi=250)
-    axes = np.atleast_1d(axes).ravel()
-
-    last_sc = None
-    for i, r in enumerate(radii):
-        ax = axes[i]
-        sig = (plot_df[r].to_numpy(dtype=float) < alpha).astype(int)
-        last_sc = ax.scatter(
-            plot_df[x_col].to_numpy(dtype=float),
-            plot_df[y_col].to_numpy(dtype=float),
-            c=sig,
-            cmap="coolwarm",
-            vmin=0,
-            vmax=1,
-            s=point_size,
-            linewidths=0,
-        )
-        ax.set_title(f"Radius = {r}")
-        ax.set_xlabel(x_col)
-        ax.set_ylabel(y_col)
-        ax.set_aspect("equal")
-
-    for j in range(n_panels, len(axes)):
-        axes[j].axis("off")
-
-    if last_sc is not None:
-        cbar = fig.colorbar(last_sc, ax=axes.tolist(), fraction=0.046, pad=0.04, ticks=[0, 1])
-        cbar.ax.set_yticklabels(["No (p>=alpha)", "Yes (p<alpha)"])
-        cbar.set_label("Locally significantly diverse")
-
-    fig.suptitle("Local significant diversity map (binary)", fontsize=14)
-    fig.tight_layout()
-    return fig, axes
 
 
 def plot_gene_effect_volcano(
