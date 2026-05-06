@@ -218,7 +218,9 @@ class SpatioLD:
         pval_pooling: str = "neighborhood_size",
         return_distribution: bool = True,
         return_permutation_means: bool = False,
+        return_observed: bool = False,
         store: bool = True,
+        observed_key: str = "spatiold_local_diversity",
         mixing_pvals_key: str = "spatiold_local_diversity_pvals_mixing",
         segregation_pvals_key: str = "spatiold_local_diversity_pvals_segregation",
         two_sided_pvals_key: str = "spatiold_local_diversity_pvals_two_sided",
@@ -241,8 +243,14 @@ class SpatioLD:
             pval_pooling=pval_pooling,
             return_distribution=return_distribution,
             return_permutation_means=return_permutation_means,
+            return_observed=return_observed,
         )
         if store:
+            if return_observed:
+                observed = stats.get("observed")
+                if observed is None:
+                    raise RuntimeError("Missing observed local-diversity matrix.")
+                store_matrix_in_anndata(self.adata, observed, key=observed_key)
             store_matrix_in_anndata(self.adata, stats["pvals_mixing"], key=mixing_pvals_key)
             store_matrix_in_anndata(self.adata, stats["pvals_segregation"], key=segregation_pvals_key)
             store_matrix_in_anndata(self.adata, stats["pvals_two_sided"], key=two_sided_pvals_key)

@@ -840,16 +840,15 @@ def _run_metadata_only_lite_pipeline(
     perm_std_key = "spatiold_local_diversity_perm_std"
     zscore_key = "spatiold_local_diversity_zscore"
 
-    ld_df = obj.compute_local_diversity(
-        radii=radii,
-        include_self=include_self,
-        kernel=spatial_kernel,
-        kernel_support=kernel_support,
-        key=ld_key,
-    )
-    summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
-
     if skip_permutation:
+        ld_df = obj.compute_local_diversity(
+            radii=radii,
+            include_self=include_self,
+            kernel=spatial_kernel,
+            kernel_support=kernel_support,
+            key=ld_key,
+        )
+        summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
         pvals_mixing_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         pvals_segregation_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         pvals_two_sided_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
@@ -873,7 +872,9 @@ def _run_metadata_only_lite_pipeline(
             kernel_support=kernel_support,
             return_distribution=save_perm_distribution,
             return_permutation_means=not save_perm_distribution,
+            return_observed=True,
             store=True,
+            observed_key=ld_key,
             mixing_pvals_key=pval_mixing_key,
             segregation_pvals_key=pval_segregation_key,
             two_sided_pvals_key=pval_two_sided_key,
@@ -882,6 +883,8 @@ def _run_metadata_only_lite_pipeline(
             zscore_key=zscore_key,
             pval_pooling=args.pval_pooling,
         )
+        ld_df = perm_stats["observed"]
+        summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
         pvals_mixing_df = perm_stats["pvals_mixing"]
         pvals_segregation_df = perm_stats["pvals_segregation"]
         pvals_two_sided_df = perm_stats["pvals_two_sided"]
@@ -1068,16 +1071,15 @@ def run_pipeline(
     perm_std_key = "spatiold_local_diversity_perm_std"
     zscore_key = "spatiold_local_diversity_zscore"
 
-    ld_df = obj.compute_local_diversity(
-        radii=radii,
-        include_self=include_self,
-        kernel=spatial_kernel,
-        kernel_support=kernel_support,
-        key=ld_key,
-    )
-    summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
-
     if skip_permutation:
+        ld_df = obj.compute_local_diversity(
+            radii=radii,
+            include_self=include_self,
+            kernel=spatial_kernel,
+            kernel_support=kernel_support,
+            key=ld_key,
+        )
+        summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
         pvals_mixing_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         pvals_segregation_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
         pvals_two_sided_df = pd.DataFrame(np.nan, index=ld_df.index, columns=ld_df.columns)
@@ -1101,7 +1103,9 @@ def run_pipeline(
             kernel_support=kernel_support,
             return_distribution=save_perm_distribution,
             return_permutation_means=not save_perm_distribution,
+            return_observed=True,
             store=True,
+            observed_key=ld_key,
             mixing_pvals_key=pval_mixing_key,
             segregation_pvals_key=pval_segregation_key,
             two_sided_pvals_key=pval_two_sided_key,
@@ -1110,6 +1114,8 @@ def run_pipeline(
             zscore_key=zscore_key,
             pval_pooling=args.pval_pooling,
         )
+        ld_df = perm_stats["observed"]
+        summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
         pvals_mixing_df = perm_stats["pvals_mixing"]
         pvals_segregation_df = perm_stats["pvals_segregation"]
         pvals_two_sided_df = perm_stats["pvals_two_sided"]

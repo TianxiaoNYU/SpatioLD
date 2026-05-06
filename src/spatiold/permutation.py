@@ -208,6 +208,8 @@ def _finalize_group_moments(
                 continue
 
             pooled_var = (group_sumsq[ridx][count] - pooled_n * (pooled_mean**2)) / float(pooled_n - 1)
+            if abs(float(pooled_var)) < 1e-14:
+                pooled_var = 0.0
             std[ridx, idx] = np.sqrt(max(float(pooled_var), 0.0))
 
     return mean, std
@@ -310,6 +312,7 @@ def _compute_nd_permutation_outputs(
     need_std: bool,
     need_distribution: bool,
     need_permutation_means: bool,
+    need_observed: bool = False,
 ) -> tuple[
     pd.DataFrame | None,
     pd.DataFrame | None,
@@ -319,6 +322,7 @@ def _compute_nd_permutation_outputs(
     pd.DataFrame | None,
     np.ndarray | None,
     np.ndarray | None,
+    pd.DataFrame | None,
 ]:
     if n_perm < 1:
         raise ValueError("`n_perm` must be >= 1.")
@@ -346,7 +350,7 @@ def _compute_nd_permutation_outputs(
     greater_counts = None
     less_counts = None
     pval_denominator = None
-    if need_pvals:
+    if need_pvals or need_observed:
         observed = _compute_local_diversity_from_label_codes(
             label_codes,
             n_labels,
@@ -354,16 +358,19 @@ def _compute_nd_permutation_outputs(
             weights_by_radius=weights_by_radius,
             base=base,
         )
-        pval_pooling_mode = _resolve_pval_pooling(pval_pooling)
-        greater_counts = np.zeros_like(observed, dtype=np.int64)
-        less_counts = np.zeros_like(observed, dtype=np.int64)
-        pval_denominator = _build_pval_denominator(
-            n_perm=n_perm,
-            n_radii=n_radii,
-            n_cells=n_cells,
-            pval_pooling=pval_pooling_mode,
-            groups_by_radius=groups_by_radius,
-        )
+        if need_pvals:
+            pval_pooling_mode = _resolve_pval_pooling(pval_pooling)
+            greater_counts = np.zeros_like(observed, dtype=np.int64)
+            less_counts = np.zeros_like(observed, dtype=np.int64)
+            pval_denominator = _build_pval_denominator(
+                n_perm=n_perm,
+                n_radii=n_radii,
+                n_cells=n_cells,
+                pval_pooling=pval_pooling_mode,
+                groups_by_radius=groups_by_radius,
+            )
+        else:
+            pval_pooling_mode = "cell"
     else:
         pval_pooling_mode = "cell"
 
@@ -471,6 +478,12 @@ def _compute_nd_permutation_outputs(
             zscore = (observed - mean_matrix) / (std_matrix + _ZSCORE_EPSILON_DEFAULT)
             zscore_df = pd.DataFrame(zscore.T, columns=radii_list, index=cell_ids)
 
+    observed_df = None
+    if need_observed:
+        if observed is None:
+            raise RuntimeError("Missing observed local-diversity matrix.")
+        observed_df = pd.DataFrame(observed.T, columns=radii_list, index=cell_ids)
+
     return (
         pvals_mixing_df,
         pvals_segregation_df,
@@ -480,6 +493,7 @@ def _compute_nd_permutation_outputs(
         zscore_df,
         perm_dist,
         perm_means,
+        observed_df,
     )
 
 
@@ -498,6 +512,7 @@ def compute_nd_permutation_stats(
     pval_pooling: str = "neighborhood_size",
     return_distribution: bool = True,
     return_permutation_means: bool = False,
+    return_observed: bool = False,
 ) -> dict[str, pd.DataFrame | np.ndarray]:
     """Compute permutation p-values and matched null moments in one pass.
 
@@ -524,6 +539,8 @@ def compute_nd_permutation_stats(
           ``return_distribution=True``
         - ``"permutation_means"``: ndarray ``(n_perm, n_radii)`` when
           ``return_permutation_means=True``
+        - ``"observed"``: observed local-diversity DataFrame when
+          ``return_observed=True``
     """
     (
         pvals_mixing_df,
@@ -534,6 +551,7 @@ def compute_nd_permutation_stats(
         zscore_df,
         perm_dist,
         perm_means,
+        observed_df,
     ) = _compute_nd_permutation_outputs(
         xy,
         labels,
@@ -551,6 +569,7 @@ def compute_nd_permutation_stats(
         need_std=True,
         need_distribution=return_distribution,
         need_permutation_means=return_permutation_means,
+        need_observed=return_observed,
     )
     if (
         pvals_mixing_df is None
@@ -561,6 +580,7 @@ def compute_nd_permutation_stats(
         or zscore_df is None
         or (return_distribution and perm_dist is None)
         or (return_permutation_means and perm_means is None)
+        or (return_observed and observed_df is None)
     ):
         raise RuntimeError("Failed to compute permutation outputs.")
     stats: dict[str, pd.DataFrame | np.ndarray] = {
@@ -576,6 +596,10 @@ def compute_nd_permutation_stats(
         if perm_means is None:
             raise RuntimeError("Missing per-permutation radius means.")
         stats["permutation_means"] = perm_means
+    if return_observed:
+        if observed_df is None:
+            raise RuntimeError("Missing observed local-diversity matrix.")
+        stats["observed"] = observed_df
     return stats
 
 
@@ -596,7 +620,7 @@ def compute_nd_permutation_mean(
 
     Returns a DataFrame with shape ``(n_cells, n_radii)``.
     """
-    _, _, _, perm_mean_df, _, _, _, _ = _compute_nd_permutation_outputs(
+    _, _, _, perm_mean_df, _, _, _, _, _ = _compute_nd_permutation_outputs(
         xy,
         labels,
         n_perm,
@@ -612,6 +636,7 @@ def compute_nd_permutation_mean(
         need_std=False,
         need_distribution=False,
         need_permutation_means=False,
+        need_observed=False,
     )
     if perm_mean_df is None:
         raise RuntimeError("Failed to compute permutation mean.")
@@ -632,7 +657,7 @@ def compute_nd_permutation_std(
     kernel_support: float | None = None,
 ) -> pd.DataFrame:
     """Compute matched permutation null standard deviation for neighborhood diversity."""
-    _, _, _, _, perm_std_df, _, _, _ = _compute_nd_permutation_outputs(
+    _, _, _, _, perm_std_df, _, _, _, _ = _compute_nd_permutation_outputs(
         xy,
         labels,
         n_perm,
@@ -648,6 +673,7 @@ def compute_nd_permutation_std(
         need_std=True,
         need_distribution=False,
         need_permutation_means=False,
+        need_observed=False,
     )
     if perm_std_df is None:
         raise RuntimeError("Failed to compute permutation standard deviation.")
@@ -674,7 +700,7 @@ def compute_nd_permutation_distribution(
     np.ndarray
         Array with shape ``(n_perm, n_radii, n_cells)``.
     """
-    _, _, _, _, _, _, perm_dist, _ = _compute_nd_permutation_outputs(
+    _, _, _, _, _, _, perm_dist, _, _ = _compute_nd_permutation_outputs(
         xy,
         labels,
         n_perm,
@@ -690,6 +716,7 @@ def compute_nd_permutation_distribution(
         need_std=False,
         need_distribution=True,
         need_permutation_means=False,
+        need_observed=False,
     )
     if perm_dist is None:
         raise RuntimeError("Failed to compute permutation distribution.")

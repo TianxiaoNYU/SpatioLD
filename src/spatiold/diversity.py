@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from scipy.sparse import csr_matrix
 from scipy.spatial import KDTree
 from sklearn.neighbors import radius_neighbors_graph
 
@@ -190,6 +191,111 @@ def _build_compact_neighbor_graph(
     )
 
 
+def _indptr_from_edge_mask(base_indptr: np.ndarray, edge_mask: np.ndarray) -> np.ndarray:
+    cumulative = np.empty(edge_mask.size + 1, dtype=np.int64)
+    cumulative[0] = 0
+    np.cumsum(edge_mask, dtype=np.int64, out=cumulative[1:])
+    counts = cumulative[base_indptr[1:]] - cumulative[base_indptr[:-1]]
+
+    indptr = np.empty(base_indptr.shape[0], dtype=np.int64)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+    return indptr
+
+
+def _build_compact_neighbor_graphs_from_shared_distances(
+    coords_arr: np.ndarray,
+    radii: Sequence[float],
+    *,
+    include_self: bool,
+    kernel_fn: Callable[[np.ndarray], np.ndarray] | None,
+    kernel_support: float,
+) -> list[_NeighborGraph]:
+    max_search_radius = float(max(radii)) * float(kernel_support)
+    base_graph = radius_neighbors_graph(
+        coords_arr,
+        radius=max_search_radius,
+        mode="distance",
+        include_self=include_self,
+    ).tocsr()
+    base_graph.sort_indices()
+
+    base_indptr = base_graph.indptr.astype(np.int64, copy=False)
+    base_indices = base_graph.indices.astype(np.int32, copy=False)
+    base_distances = base_graph.data.astype(float, copy=False)
+
+    graphs: list[_NeighborGraph] = []
+    for radius in radii:
+        search_radius = float(radius) * float(kernel_support)
+        use_all_edges = search_radius >= max_search_radius
+        distance_mask = None if use_all_edges else base_distances <= search_radius
+
+        if kernel_fn is None:
+            if use_all_edges:
+                graphs.append(
+                    _NeighborGraph(
+                        indptr=base_indptr,
+                        indices=base_indices,
+                        weights=None,
+                    )
+                )
+                continue
+            if distance_mask is None:
+                raise RuntimeError("Missing distance mask for radius-specific neighborhood graph.")
+            graphs.append(
+                _NeighborGraph(
+                    indptr=_indptr_from_edge_mask(base_indptr, distance_mask),
+                    indices=base_indices[distance_mask],
+                    weights=None,
+                )
+            )
+            continue
+
+        selected_distances = base_distances if use_all_edges else base_distances[distance_mask]
+        weights = np.asarray(kernel_fn(selected_distances / float(radius)), dtype=np.float32)
+        if weights.shape != selected_distances.shape:
+            raise ValueError("Kernel weights must align with neighborhood indices.")
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("Kernel weights must be finite.")
+        if np.any(weights < 0):
+            raise ValueError("Kernel weights must be nonnegative.")
+
+        positive = weights > 0
+        if np.all(positive):
+            if use_all_edges:
+                graphs.append(
+                    _NeighborGraph(
+                        indptr=base_indptr,
+                        indices=base_indices,
+                        weights=weights.astype(np.float32, copy=False),
+                    )
+                )
+                continue
+            if distance_mask is None:
+                raise RuntimeError("Missing distance mask for radius-specific neighborhood graph.")
+            edge_mask = distance_mask
+            graph_weights = weights
+        else:
+            selected_positions = (
+                np.arange(base_distances.size, dtype=np.int64)
+                if use_all_edges
+                else np.flatnonzero(distance_mask)
+            )
+            edge_mask = np.zeros(base_distances.shape, dtype=bool)
+            edge_mask[selected_positions[positive]] = True
+            graph_weights = weights[positive]
+
+        graphs.append(
+            _NeighborGraph(
+                indptr=_indptr_from_edge_mask(base_indptr, edge_mask),
+                indices=base_indices[edge_mask],
+                weights=graph_weights.astype(np.float32, copy=False),
+            )
+        )
+
+    return graphs
+
+
 def _precompute_neighbor_graphs(
     coords: pd.DataFrame | np.ndarray | Sequence[Sequence[float]],
     radii: Sequence[float] | None = None,
@@ -204,17 +310,26 @@ def _precompute_neighbor_graphs(
     resolved_support = _resolve_kernel_support(kernel_name, kernel_support)
     use_weights = _kernel_requires_weights(kernel)
 
-    graphs: list[_NeighborGraph] = []
-    for radius in radii_list:
-        graphs.append(
+    radius_kernel_fn = kernel_fn if use_weights else None
+    if resolved_support is not None and len(radii_list) > 1:
+        graphs = _build_compact_neighbor_graphs_from_shared_distances(
+            coords_arr,
+            radii_list,
+            include_self=include_self,
+            kernel_fn=radius_kernel_fn,
+            kernel_support=resolved_support,
+        )
+    else:
+        graphs = [
             _build_compact_neighbor_graph(
                 coords_arr,
                 radius=radius,
                 include_self=include_self,
-                kernel_fn=kernel_fn if use_weights else None,
+                kernel_fn=radius_kernel_fn,
                 kernel_support=resolved_support,
             )
-        )
+            for radius in radii_list
+        ]
     return coords_arr, radii_list, graphs
 
 
@@ -247,7 +362,85 @@ def _entropy_from_codes(
             raise ValueError("`base` must be positive and not equal to 1.")
         log_probs = log_probs / np.log(base)
 
-    return float(-(probs * log_probs).sum())
+    entropy = float(-(probs * log_probs).sum())
+    return 0.0 if abs(entropy) < 1e-12 else entropy
+
+
+def _label_codes_to_sparse_indicator(label_codes: np.ndarray, n_labels: int) -> csr_matrix:
+    n_cells = label_codes.shape[0]
+    if n_cells == 0 or n_labels == 0:
+        return csr_matrix((n_cells, n_labels), dtype=float)
+
+    indicator = csr_matrix(
+        (
+            np.ones(n_cells, dtype=np.float32),
+            (np.arange(n_cells, dtype=np.int64), label_codes),
+        ),
+        shape=(n_cells, n_labels),
+    )
+    return indicator
+
+
+def _neighbor_graph_to_csr(graph: _NeighborGraph, n_cells: int) -> csr_matrix:
+    if graph.indptr.shape[0] != n_cells + 1:
+        raise ValueError("All radii in `neighbors_by_radius` must have the same number of cells.")
+    data = (
+        np.ones(graph.indices.shape[0], dtype=np.float32)
+        if graph.weights is None
+        else graph.weights
+    )
+    return csr_matrix((data, graph.indices, graph.indptr), shape=(n_cells, n_cells), copy=False)
+
+
+def _entropy_from_sparse_label_weight_matrix(
+    label_weights: csr_matrix,
+    *,
+    base: float = 2.0,
+) -> np.ndarray:
+    if base is not None and (base <= 0 or base == 1):
+        raise ValueError("`base` must be positive and not equal to 1.")
+
+    n_cells = label_weights.shape[0]
+    entropy = np.zeros(n_cells, dtype=float)
+    if label_weights.nnz == 0:
+        return entropy
+
+    totals = np.asarray(label_weights.sum(axis=1)).ravel().astype(float, copy=False)
+    row_counts = np.diff(label_weights.indptr)
+    rows = np.repeat(np.arange(n_cells, dtype=np.int64), row_counts)
+    valid = totals[rows] > 0
+    if not np.any(valid):
+        return entropy
+
+    probs = label_weights.data[valid].astype(float, copy=False) / totals[rows[valid]]
+    positive = probs > 0
+    terms = np.zeros_like(probs, dtype=float)
+    terms[positive] = probs[positive] * np.log(probs[positive])
+    if base is not None:
+        terms[positive] = terms[positive] / np.log(base)
+
+    entropy = -np.bincount(rows[valid], weights=terms, minlength=n_cells)
+    entropy[np.abs(entropy) < 1e-12] = 0.0
+    return entropy
+
+
+def _compute_local_diversity_from_neighbor_graphs(
+    label_codes: np.ndarray,
+    n_labels: int,
+    neighbors_by_radius: Sequence[_NeighborGraph],
+    *,
+    base: float = 2.0,
+) -> np.ndarray:
+    n_cells = int(label_codes.shape[0])
+    label_indicator = _label_codes_to_sparse_indicator(label_codes, n_labels)
+    output = np.zeros((len(neighbors_by_radius), n_cells), dtype=float)
+
+    for ridx, graph in enumerate(neighbors_by_radius):
+        graph_csr = _neighbor_graph_to_csr(graph, n_cells)
+        label_weights = graph_csr @ label_indicator
+        output[ridx] = _entropy_from_sparse_label_weight_matrix(label_weights, base=base)
+
+    return output
 
 
 def _finalize_neighbors_and_weights(
@@ -286,6 +479,14 @@ def _compute_local_diversity_from_label_codes(
         raise ValueError("`label_codes` length must match number of cells in `neighbors_by_radius`.")
     if weights_by_radius is not None and len(weights_by_radius) != n_radii:
         raise ValueError("`weights_by_radius` must align with `neighbors_by_radius`.")
+
+    if all(isinstance(neighbors, _NeighborGraph) for neighbors in neighbors_by_radius):
+        return _compute_local_diversity_from_neighbor_graphs(
+            label_codes,
+            n_labels,
+            neighbors_by_radius,  # type: ignore[arg-type]
+            base=base,
+        )
 
     output = np.zeros((n_radii, n_cells), dtype=float)
     for ridx, neighbors in enumerate(neighbors_by_radius):
