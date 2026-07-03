@@ -37,10 +37,17 @@ Main methods:
 
 - `compute_local_diversity(coords, labels, radius, ...)`
 - `compute_local_diversity_multi_radius(coords, labels, radii, ...)`
+- local-diversity functions accept `aggregation_backend="auto"` by default;
+  use `"csr"` for the legacy sparse-matrix path or `"edge"` for the exact
+  finite-support edge-list aggregation backend
 - `compute_nd_permutation_pvals(xy, labels, n_perm, ..., pval_pooling="neighborhood_size")`
 - `compute_nd_permutation_mean(xy, labels, n_perm, ...)`
 - `compute_nd_permutation_distribution(xy, labels, n_perm, ...)`
 - `compute_nd_permutation_stats(xy, labels, n_perm, ..., pval_pooling="neighborhood_size")` (single-pass combined output)
+- permutation helpers also accept `aggregation_backend`; permutations still
+  shuffle labels globally and reuse the same spatial graph
+- `n_jobs` defaults to 1; edge-backend permutations use `perm_block_size=32`
+  by default to evaluate blocked global label permutations in one compiled pass
 - `DEFAULT_RADII`
 
 ## Updated SlideTag-Style Pipeline

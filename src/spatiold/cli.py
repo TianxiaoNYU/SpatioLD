@@ -387,6 +387,17 @@ def _add_common_pipeline_arguments(
         action="store_true",
         help="Exclude the focal cell from its own neighborhood so the score uses w_ii = 0.",
     )
+    parser.add_argument(
+        "--ld-backend",
+        type=str,
+        choices=["auto", "csr", "edge"],
+        default="auto",
+        help=(
+            "Local-diversity aggregation backend. `auto` uses the exact edge-list "
+            "backend when available, `csr` forces the legacy sparse-matrix path, "
+            "and `edge` requires the edge-list backend."
+        ),
+    )
 
     parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
@@ -430,11 +441,12 @@ def _add_common_pipeline_arguments(
     parser.add_argument("--quiet", action="store_true", help="Reduce progress messages.")
 
 
-def _resolve_spatial_weighting_args(args: argparse.Namespace) -> tuple[bool, str, float | None]:
+def _resolve_spatial_weighting_args(args: argparse.Namespace) -> tuple[bool, str, float | None, str]:
     include_self = not bool(getattr(args, "exclude_self", False))
     kernel = str(getattr(args, "spatial_kernel", "indicator"))
     kernel_support = getattr(args, "kernel_support", None)
-    return include_self, kernel, kernel_support
+    ld_backend = str(getattr(args, "ld_backend", "auto"))
+    return include_self, kernel, kernel_support, ld_backend
 
 
 def _add_permutation_arguments(parser: argparse.ArgumentParser) -> None:
@@ -447,10 +459,19 @@ def _add_permutation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--n-jobs",
         type=int,
-        default=4,
+        default=1,
         help=(
-            "Number of worker processes for permutations. Default is 4, which is "
-            "safer on laptops with large samples. Use -1 to use nearly all cores."
+            "Number of worker processes for permutations. Default is 1, which is "
+            "recommended for the edge-list LD backend. Use -1 to use nearly all cores."
+        ),
+    )
+    parser.add_argument(
+        "--perm-block-size",
+        type=int,
+        default=32,
+        help=(
+            "Number of global label permutations evaluated per compiled edge-list "
+            "pass when using the edge LD backend with one worker."
         ),
     )
     parser.add_argument(
@@ -568,6 +589,17 @@ def build_cluster_parser() -> argparse.ArgumentParser:
         "--exclude-self",
         action="store_true",
         help="Exclude the focal cell from its own neighborhood so the score uses w_ii = 0.",
+    )
+    parser.add_argument(
+        "--ld-backend",
+        type=str,
+        choices=["auto", "csr", "edge"],
+        default="auto",
+        help=(
+            "Local-diversity aggregation backend. `auto` uses the exact edge-list "
+            "backend when available, `csr` forces the legacy sparse-matrix path, "
+            "and `edge` requires the edge-list backend."
+        ),
     )
     parser.add_argument("--cell-id-col", type=str, default=None, help="Metadata column containing cell IDs. If omitted, use `unique_id` when present, otherwise existing index.")
     parser.add_argument("--x-col", type=str, default="x", help="Metadata x-coordinate column.")
@@ -790,7 +822,7 @@ def _run_metadata_only_lite_pipeline(
     is only needed for gene-level outputs, which are intentionally skipped here.
     """
     radii = _parse_radii(args.radii)
-    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
+    include_self, spatial_kernel, kernel_support, ld_backend = _resolve_spatial_weighting_args(args)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -846,6 +878,7 @@ def _run_metadata_only_lite_pipeline(
             include_self=include_self,
             kernel=spatial_kernel,
             kernel_support=kernel_support,
+            aggregation_backend=ld_backend,
             key=ld_key,
         )
         summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
@@ -862,14 +895,17 @@ def _run_metadata_only_lite_pipeline(
     else:
         save_perm_distribution = bool(getattr(args, "save_permutation_distribution", False))
         n_jobs = int(getattr(args, "n_jobs", 1))
+        perm_block_size = int(getattr(args, "perm_block_size", 32))
         perm_stats = obj.compute_permutation_stats(
             n_perm=args.n_perm,
             radii=radii,
             random_state=args.random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             kernel=spatial_kernel,
             kernel_support=kernel_support,
+            aggregation_backend=ld_backend,
             return_distribution=save_perm_distribution,
             return_permutation_means=not save_perm_distribution,
             return_observed=True,
@@ -976,6 +1012,7 @@ def _run_metadata_only_lite_pipeline(
         "permutation_enabled": not skip_permutation,
         "n_perm": int(args.n_perm) if not skip_permutation else 0,
         "n_jobs": int(getattr(args, "n_jobs", 1)) if not skip_permutation else 0,
+        "perm_block_size": int(getattr(args, "perm_block_size", 32)) if not skip_permutation else 0,
         "pval_pooling": getattr(args, "pval_pooling", None) if not skip_permutation else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
@@ -996,6 +1033,7 @@ def _run_metadata_only_lite_pipeline(
         print(f"Radii: {radii}")
         if not skip_permutation:
             print(f"Permutation workers: {int(getattr(args, 'n_jobs', 1))}")
+            print(f"Permutation block size: {int(getattr(args, 'perm_block_size', 32))}")
             print(f"P-value pooling: {args.pval_pooling}")
 
 
@@ -1007,7 +1045,7 @@ def run_pipeline(
     skip_svg: bool = False,
 ) -> None:
     radii = _parse_radii(args.radii)
-    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
+    include_self, spatial_kernel, kernel_support, ld_backend = _resolve_spatial_weighting_args(args)
     gene_model_mode = str(getattr(args, "gene_model_mode", "single"))
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1077,6 +1115,7 @@ def run_pipeline(
             include_self=include_self,
             kernel=spatial_kernel,
             kernel_support=kernel_support,
+            aggregation_backend=ld_backend,
             key=ld_key,
         )
         summary_ct = obj.summarize_local_diversity_by_cell_type(local_diversity_key=ld_key)
@@ -1093,14 +1132,17 @@ def run_pipeline(
     else:
         save_perm_distribution = bool(getattr(args, "save_permutation_distribution", False))
         n_jobs = int(getattr(args, "n_jobs", 1))
+        perm_block_size = int(getattr(args, "perm_block_size", 32))
         perm_stats = obj.compute_permutation_stats(
             n_perm=args.n_perm,
             radii=radii,
             random_state=args.random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             kernel=spatial_kernel,
             kernel_support=kernel_support,
+            aggregation_backend=ld_backend,
             return_distribution=save_perm_distribution,
             return_permutation_means=not save_perm_distribution,
             return_observed=True,
@@ -1251,6 +1293,7 @@ def run_pipeline(
         "permutation_enabled": not skip_permutation,
         "n_perm": int(args.n_perm) if not skip_permutation else 0,
         "n_jobs": int(getattr(args, "n_jobs", 1)) if not skip_permutation else 0,
+        "perm_block_size": int(getattr(args, "perm_block_size", 32)) if not skip_permutation else 0,
         "pval_pooling": getattr(args, "pval_pooling", None) if not skip_permutation else None,
     }
     (output_dir / "run_summary.json").write_text(json.dumps(summary_payload, indent=2))
@@ -1280,12 +1323,13 @@ def run_pipeline(
         print(f"Radii: {radii}")
         if not skip_permutation:
             print(f"Permutation workers: {int(getattr(args, 'n_jobs', 1))}")
+            print(f"Permutation block size: {int(getattr(args, 'perm_block_size', 32))}")
             print(f"P-value pooling: {args.pval_pooling}")
 
 
 def run_cluster_pipeline(args: argparse.Namespace) -> None:
     radii = _parse_radii(args.radii)
-    include_self, spatial_kernel, kernel_support = _resolve_spatial_weighting_args(args)
+    include_self, spatial_kernel, kernel_support, ld_backend = _resolve_spatial_weighting_args(args)
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1349,6 +1393,7 @@ def run_cluster_pipeline(args: argparse.Namespace) -> None:
             include_self=include_self,
             kernel=spatial_kernel,
             kernel_support=kernel_support,
+            aggregation_backend=ld_backend,
         )
         cluster_meta = pd.DataFrame({"cluster_label": cluster_labels})
         if args.cell_size_col is not None:
