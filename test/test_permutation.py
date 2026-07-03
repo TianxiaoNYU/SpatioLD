@@ -297,3 +297,78 @@ def test_matched_null_mean_and_std_match_manual_group_pooling() -> None:
 
     assert np.allclose(mean_df.iloc[:, 0].to_numpy(), expected_mean)
     assert np.allclose(std_df.iloc[:, 0].to_numpy(), expected_std)
+
+
+def test_edge_backend_permutation_stats_match_csr_backend() -> None:
+    coords = pd.DataFrame(
+        {
+            "x": [0.0, 0.5, 1.2, 2.0, 2.8, 3.6],
+            "y": [0.0, 0.3, 1.0, 0.4, 1.2, 0.8],
+        },
+        index=[f"c{i}" for i in range(6)],
+    )
+    labels = pd.Series(["A", "B", "A", "C", "B", "C"], index=coords.index)
+
+    csr = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=7,
+        radii=[1.0, 2.0],
+        random_state=17,
+        n_jobs=1,
+        return_distribution=False,
+        return_permutation_means=True,
+        aggregation_backend="csr",
+    )
+    edge = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=7,
+        radii=[1.0, 2.0],
+        random_state=17,
+        n_jobs=1,
+        return_distribution=False,
+        return_permutation_means=True,
+        aggregation_backend="edge",
+    )
+
+    for key in ["pvals_mixing", "pvals_segregation", "pvals_two_sided", "perm_mean", "perm_std", "zscore"]:
+        assert np.allclose(edge[key].values, csr[key].values, atol=1e-7)
+    assert np.allclose(edge["permutation_means"], csr["permutation_means"])
+
+
+def test_edge_backend_permutation_block_size_does_not_change_results() -> None:
+    coords = pd.DataFrame(
+        {"x": [0.0, 0.5, 1.2, 2.0, 2.8], "y": [0.0, 0.3, 1.0, 0.4, 1.2]},
+        index=[f"c{i}" for i in range(5)],
+    )
+    labels = pd.Series(["A", "B", "A", "C", "B"], index=coords.index)
+
+    block_one = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=9,
+        radii=[1.0, 2.0],
+        random_state=19,
+        n_jobs=1,
+        perm_block_size=1,
+        return_distribution=False,
+        return_permutation_means=True,
+        aggregation_backend="edge",
+    )
+    block_four = compute_nd_permutation_stats(
+        coords,
+        labels,
+        n_perm=9,
+        radii=[1.0, 2.0],
+        random_state=19,
+        n_jobs=1,
+        perm_block_size=4,
+        return_distribution=False,
+        return_permutation_means=True,
+        aggregation_backend="edge",
+    )
+
+    for key in ["pvals_mixing", "pvals_segregation", "pvals_two_sided", "perm_mean", "perm_std", "zscore"]:
+        assert np.allclose(block_four[key].values, block_one[key].values)
+    assert np.allclose(block_four["permutation_means"], block_one["permutation_means"])

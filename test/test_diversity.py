@@ -88,3 +88,54 @@ def test_indicator_kernel_is_backward_compatible() -> None:
     )
 
     assert legacy.equals(explicit)
+
+
+def test_edge_backend_matches_csr_indicator() -> None:
+    coords = pd.DataFrame(
+        {"x": [0.0, 0.3, 1.0, 1.8, 2.7], "y": [0.0, 0.4, 0.9, 0.1, 1.1]},
+        index=[f"c{i}" for i in range(5)],
+    )
+    labels = pd.Series(["A", "B", "A", "C", "B"], index=coords.index)
+
+    csr = compute_local_diversity_multi_radius(
+        coords,
+        labels,
+        radii=[0.5, 1.5, 3.0],
+        aggregation_backend="csr",
+    )
+    edge = compute_local_diversity_multi_radius(
+        coords,
+        labels,
+        radii=[0.5, 1.5, 3.0],
+        aggregation_backend="edge",
+    )
+
+    assert edge.index.equals(csr.index)
+    assert list(edge.columns) == list(csr.columns)
+    assert np.allclose(edge.values, csr.values)
+
+
+def test_edge_backend_matches_csr_gaussian() -> None:
+    coords = pd.DataFrame({"x": [0.0, 0.5, 1.5, 3.0], "y": [0.0, 0.0, 0.0, 0.0]})
+    labels = pd.Series(["A", "A", "B", "B"])
+
+    csr = compute_local_diversity_multi_radius(
+        coords,
+        labels,
+        radii=[1.0, 2.0],
+        include_self=False,
+        kernel="gaussian",
+        kernel_support=2.0,
+        aggregation_backend="csr",
+    )
+    edge = compute_local_diversity_multi_radius(
+        coords,
+        labels,
+        radii=[1.0, 2.0],
+        include_self=False,
+        kernel="gaussian",
+        kernel_support=2.0,
+        aggregation_backend="edge",
+    )
+
+    assert np.allclose(edge.values, csr.values)

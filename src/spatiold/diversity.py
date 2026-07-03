@@ -11,8 +11,14 @@ from scipy.sparse import csr_matrix
 from scipy.spatial import KDTree
 from sklearn.neighbors import radius_neighbors_graph
 
+try:  # Optional fast path; the package still works without numba.
+    from numba import njit
+except Exception:  # pragma: no cover - depends on optional runtime dependency.
+    njit = None
+
 DEFAULT_RADII: tuple[float, ...] = (20, 30, 40, 50, 75, 100, 150, 200, 250)
 DEFAULT_GAUSSIAN_KERNEL_SUPPORT: float = 1.0
+_EDGE_BACKEND_MAX_LABEL_MATRIX_BYTES: int = 2 * 1024**3
 SpatialKernel = str | Callable[[np.ndarray], np.ndarray | Sequence[float] | float]
 
 
@@ -23,6 +29,15 @@ class _NeighborGraph:
     indptr: np.ndarray
     indices: np.ndarray
     weights: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _SharedNeighborGraph:
+    """One max-radius CSR-style graph with distances reused across radii."""
+
+    indptr: np.ndarray
+    indices: np.ndarray
+    distances: np.ndarray
 
 
 def _as_2d_coords(coords: pd.DataFrame | np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
@@ -119,6 +134,65 @@ def _factorize_labels(labels: np.ndarray) -> tuple[np.ndarray, int]:
     label_codes = label_codes.astype(np.int64, copy=False)
     n_labels = int(label_codes.max()) + 1 if label_codes.size else 0
     return label_codes, n_labels
+
+
+def _resolve_aggregation_backend(aggregation_backend: str) -> str:
+    backend = str(aggregation_backend).strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto",
+        "default": "auto",
+        "csr": "csr",
+        "sparse": "csr",
+        "edge": "edge",
+        "edge_list": "edge",
+        "edgelist": "edge",
+    }
+    try:
+        return aliases[backend]
+    except KeyError as exc:
+        raise ValueError("`aggregation_backend` must be one of {'auto', 'csr', 'edge'}.") from exc
+
+
+def _kernel_code_for_edge_backend(kernel_name: str) -> int | None:
+    if kernel_name == "indicator":
+        return 0
+    if kernel_name == "gaussian":
+        return 1
+    return None
+
+
+def _edge_backend_label_matrix_bytes(n_cells: int, n_labels: int) -> int:
+    return int(n_cells) * int(n_labels) * np.dtype(np.float64).itemsize
+
+
+def _can_use_edge_backend(
+    *,
+    aggregation_backend: str,
+    kernel_name: str,
+    resolved_support: float | None,
+    n_cells: int,
+    n_labels: int,
+) -> bool:
+    backend = _resolve_aggregation_backend(aggregation_backend)
+    kernel_code = _kernel_code_for_edge_backend(kernel_name)
+    eligible = (
+        njit is not None
+        and kernel_code is not None
+        and resolved_support is not None
+        and _edge_backend_label_matrix_bytes(n_cells, n_labels) <= _EDGE_BACKEND_MAX_LABEL_MATRIX_BYTES
+    )
+    if backend == "edge" and not eligible:
+        reasons: list[str] = []
+        if njit is None:
+            reasons.append("numba is not installed")
+        if kernel_code is None:
+            reasons.append("only built-in indicator/gaussian kernels are supported")
+        if resolved_support is None:
+            reasons.append("finite kernel support is required")
+        if _edge_backend_label_matrix_bytes(n_cells, n_labels) > _EDGE_BACKEND_MAX_LABEL_MATRIX_BYTES:
+            reasons.append("the dense cell-by-label accumulator would be too large")
+        raise ValueError("Cannot use `aggregation_backend='edge'`: " + "; ".join(reasons) + ".")
+    return backend == "edge" or (backend == "auto" and eligible)
 
 
 def _build_compact_neighbor_graph(
@@ -331,6 +405,254 @@ def _precompute_neighbor_graphs(
             for radius in radii_list
         ]
     return coords_arr, radii_list, graphs
+
+
+def _precompute_shared_neighbor_graph(
+    coords: pd.DataFrame | np.ndarray | Sequence[Sequence[float]],
+    radii: Sequence[float] | None = None,
+    *,
+    include_self: bool = True,
+    kernel: SpatialKernel = "indicator",
+    kernel_support: float | None = None,
+) -> tuple[np.ndarray, list[float], _SharedNeighborGraph, str, float]:
+    coords_arr = _as_2d_coords(coords)
+    radii_list = _as_radii(radii)
+    kernel_name, _ = _resolve_kernel(kernel)
+    resolved_support = _resolve_kernel_support(kernel_name, kernel_support)
+    if resolved_support is None:
+        raise ValueError("Shared edge-list backend requires finite kernel support.")
+
+    max_search_radius = float(max(radii_list)) * float(resolved_support)
+    base_graph = radius_neighbors_graph(
+        coords_arr,
+        radius=max_search_radius,
+        mode="distance",
+        include_self=include_self,
+    ).tocsr()
+    base_graph.sort_indices()
+
+    shared_graph = _SharedNeighborGraph(
+        indptr=base_graph.indptr.astype(np.int64, copy=False),
+        indices=base_graph.indices.astype(np.int32, copy=False),
+        distances=base_graph.data.astype(float, copy=False),
+    )
+    return coords_arr, radii_list, shared_graph, kernel_name, float(resolved_support)
+
+
+if njit is not None:
+
+    @njit
+    def _compute_local_diversity_from_shared_graph_numba(
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        distances: np.ndarray,
+        label_codes: np.ndarray,
+        n_labels: int,
+        radii: np.ndarray,
+        kernel_code: int,
+        kernel_support: float,
+        log_base: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_cells = indptr.shape[0] - 1
+        n_radii = radii.shape[0]
+        output = np.zeros((n_radii, n_cells), dtype=np.float64)
+        neighbor_counts = np.zeros((n_radii, n_cells), dtype=np.int64)
+
+        if n_cells == 0 or n_labels == 0:
+            return output, neighbor_counts
+
+        for ridx in range(n_radii):
+            radius = radii[ridx]
+            search_radius = radius * kernel_support
+            label_weights = np.zeros((n_cells, n_labels), dtype=np.float64)
+
+            for cell_idx in range(n_cells):
+                count = 0
+                row_start = indptr[cell_idx]
+                row_end = indptr[cell_idx + 1]
+                for edge_pos in range(row_start, row_end):
+                    distance = distances[edge_pos]
+                    if distance > search_radius:
+                        continue
+
+                    weight = 1.0
+                    if kernel_code == 1:
+                        scaled = distance / radius
+                        weight = np.exp(-0.5 * scaled * scaled)
+                    if weight <= 0.0:
+                        continue
+
+                    neighbor_idx = indices[edge_pos]
+                    label_weights[cell_idx, label_codes[neighbor_idx]] += weight
+                    count += 1
+                neighbor_counts[ridx, cell_idx] = count
+
+            for cell_idx in range(n_cells):
+                total = 0.0
+                for label_idx in range(n_labels):
+                    total += label_weights[cell_idx, label_idx]
+                if total <= 0.0:
+                    continue
+
+                entropy = 0.0
+                for label_idx in range(n_labels):
+                    value = label_weights[cell_idx, label_idx]
+                    if value <= 0.0:
+                        continue
+                    prob = value / total
+                    entropy -= prob * np.log(prob)
+                if log_base > 0.0:
+                    entropy /= log_base
+                if np.abs(entropy) < 1e-12:
+                    entropy = 0.0
+                output[ridx, cell_idx] = entropy
+
+        return output, neighbor_counts
+
+
+    @njit
+    def _compute_local_diversity_from_shared_graph_batch_numba(
+        indptr: np.ndarray,
+        indices: np.ndarray,
+        distances: np.ndarray,
+        label_codes_block: np.ndarray,
+        n_labels: int,
+        radii: np.ndarray,
+        kernel_code: int,
+        kernel_support: float,
+        log_base: float,
+    ) -> np.ndarray:
+        block_size = label_codes_block.shape[0]
+        n_cells = indptr.shape[0] - 1
+        n_radii = radii.shape[0]
+        output = np.zeros((block_size, n_radii, n_cells), dtype=np.float64)
+
+        if block_size == 0 or n_cells == 0 or n_labels == 0:
+            return output
+
+        label_weights = np.zeros((block_size, n_labels), dtype=np.float64)
+        for ridx in range(n_radii):
+            radius = radii[ridx]
+            search_radius = radius * kernel_support
+
+            for cell_idx in range(n_cells):
+                for perm_idx in range(block_size):
+                    for label_idx in range(n_labels):
+                        label_weights[perm_idx, label_idx] = 0.0
+
+                row_start = indptr[cell_idx]
+                row_end = indptr[cell_idx + 1]
+                for edge_pos in range(row_start, row_end):
+                    distance = distances[edge_pos]
+                    if distance > search_radius:
+                        continue
+
+                    weight = 1.0
+                    if kernel_code == 1:
+                        scaled = distance / radius
+                        weight = np.exp(-0.5 * scaled * scaled)
+                    if weight <= 0.0:
+                        continue
+
+                    neighbor_idx = indices[edge_pos]
+                    for perm_idx in range(block_size):
+                        label_idx = label_codes_block[perm_idx, neighbor_idx]
+                        label_weights[perm_idx, label_idx] += weight
+
+                for perm_idx in range(block_size):
+                    total = 0.0
+                    for label_idx in range(n_labels):
+                        total += label_weights[perm_idx, label_idx]
+                    if total <= 0.0:
+                        continue
+
+                    entropy = 0.0
+                    for label_idx in range(n_labels):
+                        value = label_weights[perm_idx, label_idx]
+                        if value <= 0.0:
+                            continue
+                        prob = value / total
+                        entropy -= prob * np.log(prob)
+                    if log_base > 0.0:
+                        entropy /= log_base
+                    if np.abs(entropy) < 1e-12:
+                        entropy = 0.0
+                    output[perm_idx, ridx, cell_idx] = entropy
+
+        return output
+
+else:
+    _compute_local_diversity_from_shared_graph_numba = None
+    _compute_local_diversity_from_shared_graph_batch_numba = None
+
+
+def _compute_local_diversity_from_shared_graph(
+    label_codes: np.ndarray,
+    n_labels: int,
+    shared_graph: _SharedNeighborGraph,
+    radii: Sequence[float],
+    *,
+    kernel_name: str,
+    kernel_support: float,
+    base: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    kernel_code = _kernel_code_for_edge_backend(kernel_name)
+    if kernel_code is None:
+        raise ValueError("Shared edge-list backend supports only built-in indicator/gaussian kernels.")
+    if _compute_local_diversity_from_shared_graph_numba is None:
+        raise ValueError("Shared edge-list backend requires numba.")
+    if base is not None and (base <= 0 or base == 1):
+        raise ValueError("`base` must be positive and not equal to 1.")
+
+    log_base = 0.0 if base is None else float(np.log(base))
+    radii_arr = np.asarray(radii, dtype=np.float64)
+    return _compute_local_diversity_from_shared_graph_numba(
+        shared_graph.indptr,
+        shared_graph.indices,
+        shared_graph.distances,
+        label_codes,
+        int(n_labels),
+        radii_arr,
+        int(kernel_code),
+        float(kernel_support),
+        log_base,
+    )
+
+
+def _compute_local_diversity_from_shared_graph_batch(
+    label_codes_block: np.ndarray,
+    n_labels: int,
+    shared_graph: _SharedNeighborGraph,
+    radii: Sequence[float],
+    *,
+    kernel_name: str,
+    kernel_support: float,
+    base: float = 2.0,
+) -> np.ndarray:
+    kernel_code = _kernel_code_for_edge_backend(kernel_name)
+    if kernel_code is None:
+        raise ValueError("Shared edge-list backend supports only built-in indicator/gaussian kernels.")
+    if _compute_local_diversity_from_shared_graph_batch_numba is None:
+        raise ValueError("Shared edge-list backend requires numba.")
+    if base is not None and (base <= 0 or base == 1):
+        raise ValueError("`base` must be positive and not equal to 1.")
+
+    labels_block = np.asarray(label_codes_block, dtype=np.int64)
+    if labels_block.ndim != 2:
+        raise ValueError("`label_codes_block` must have shape (n_perm_block, n_cells).")
+    log_base = 0.0 if base is None else float(np.log(base))
+    radii_arr = np.asarray(radii, dtype=np.float64)
+    return _compute_local_diversity_from_shared_graph_batch_numba(
+        shared_graph.indptr,
+        shared_graph.indices,
+        shared_graph.distances,
+        labels_block,
+        int(n_labels),
+        radii_arr,
+        int(kernel_code),
+        float(kernel_support),
+        log_base,
+    )
 
 
 def _entropy_from_codes(
@@ -693,6 +1015,7 @@ def compute_local_diversity(
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
 ) -> np.ndarray:
     """Compute per-cell local diversity at a single radius.
 
@@ -718,9 +1041,41 @@ def compute_local_diversity(
         weights are truncated at ``1 * radius`` to keep runtime close to the
         legacy pipeline. Use ``kernel_support=np.inf`` for exact full-graph
         Gaussian weights.
+    aggregation_backend
+        ``"auto"`` uses the direct edge-list aggregation backend when it is
+        available and exact; ``"csr"`` forces the legacy sparse-matrix path;
+        ``"edge"`` requires the edge-list backend.
     """
     coords_arr = _as_2d_coords(coords)
     labels_arr = _as_labels(labels, coords_arr.shape[0])
+    label_codes, n_labels = _factorize_labels(labels_arr)
+    kernel_name, _ = _resolve_kernel(kernel)
+    resolved_support = _resolve_kernel_support(kernel_name, kernel_support)
+
+    if _can_use_edge_backend(
+        aggregation_backend=aggregation_backend,
+        kernel_name=kernel_name,
+        resolved_support=resolved_support,
+        n_cells=coords_arr.shape[0],
+        n_labels=n_labels,
+    ):
+        _, radii_list, shared_graph, shared_kernel_name, shared_support = _precompute_shared_neighbor_graph(
+            coords_arr,
+            [radius],
+            include_self=include_self,
+            kernel=kernel,
+            kernel_support=kernel_support,
+        )
+        matrix, _ = _compute_local_diversity_from_shared_graph(
+            label_codes,
+            n_labels,
+            shared_graph,
+            radii_list,
+            kernel_name=shared_kernel_name,
+            kernel_support=shared_support,
+            base=base,
+        )
+        return matrix[0]
 
     _, _, neighbor_graphs = _precompute_neighbor_graphs(
         coords_arr,
@@ -746,8 +1101,16 @@ def compute_local_diversity_multi_radius(
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
 ) -> pd.DataFrame:
     """Compute per-cell local diversity across multiple radii.
+
+    Parameters
+    ----------
+    aggregation_backend
+        ``"auto"`` uses the direct edge-list aggregation backend when it is
+        available and exact; ``"csr"`` forces the legacy sparse-matrix path;
+        ``"edge"`` requires the edge-list backend.
 
     Returns
     -------
@@ -757,10 +1120,39 @@ def compute_local_diversity_multi_radius(
     coords_arr = _as_2d_coords(coords)
     labels_arr = _as_labels(labels, coords_arr.shape[0])
     cell_ids = _cell_ids(coords, labels, coords_arr.shape[0])
+    radii_list = _as_radii(radii)
+    label_codes, n_labels = _factorize_labels(labels_arr)
+    kernel_name, _ = _resolve_kernel(kernel)
+    resolved_support = _resolve_kernel_support(kernel_name, kernel_support)
+
+    if _can_use_edge_backend(
+        aggregation_backend=aggregation_backend,
+        kernel_name=kernel_name,
+        resolved_support=resolved_support,
+        n_cells=coords_arr.shape[0],
+        n_labels=n_labels,
+    ):
+        _, radii_list, shared_graph, shared_kernel_name, shared_support = _precompute_shared_neighbor_graph(
+            coords_arr,
+            radii=radii_list,
+            include_self=include_self,
+            kernel=kernel,
+            kernel_support=kernel_support,
+        )
+        matrix, _ = _compute_local_diversity_from_shared_graph(
+            label_codes,
+            n_labels,
+            shared_graph,
+            radii_list,
+            kernel_name=shared_kernel_name,
+            kernel_support=shared_support,
+            base=base,
+        )
+        return pd.DataFrame(matrix.T, index=cell_ids, columns=radii_list)
 
     _, radii_list, neighbor_graphs = _precompute_neighbor_graphs(
         coords_arr,
-        radii=radii,
+        radii=radii_list,
         include_self=include_self,
         kernel=kernel,
         kernel_support=kernel_support,

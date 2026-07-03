@@ -39,6 +39,13 @@ Install this package in editable mode inside that environment:
 pip install -e .
 ```
 
+For the exact edge-list local-diversity backend, install the optional fast
+dependency if your environment does not already include Numba:
+
+```bash
+pip install -e ".[fast]"
+```
+
 ## Quick Start
 
 ### 1) Functional API
@@ -72,6 +79,16 @@ ld_weighted = sld.compute_local_diversity_multi_radius(
     kernel="gaussian",
 )
 # For exact full-graph Gaussian weights, add `kernel_support=np.inf`.
+
+# force the exact edge-list aggregation backend when finite support is used
+ld_fast = sld.compute_local_diversity_multi_radius(
+    coords,
+    labels,
+    radii=[2.0],
+    kernel="gaussian",
+    kernel_support=2.0,
+    aggregation_backend="edge",
+)
 ```
 
 ### 2) SpatioLD Object Workflow
@@ -259,6 +276,13 @@ Common optional inputs (dataset-dependent):
 - `--spatial-kernel gaussian` and optional `--kernel-support` for distance-weighted local diversity
   (default `--kernel-support 1` keeps the same fixed neighborhood as the legacy radius mode;
   `--kernel-support inf` gives the exact full Gaussian graph)
+- `--ld-backend auto|csr|edge` to choose local-diversity aggregation; `auto`
+  uses the exact edge-list backend when Numba is available, support is finite,
+  and the cell-by-label accumulator is reasonably sized
+- `--n-jobs` defaults to 1 for permutation inference; this is recommended for
+  the edge backend because geometry is reused in-process
+- `--perm-block-size` defaults to 32 and controls how many global label
+  permutations are evaluated per compiled edge-list pass when `--n-jobs 1`
 - `--exclude-self` to match the weighted-graph convention `w_ii = 0`
 - `--spatial-key` to read coordinates from `adata.obsm[spatial_key]` in `.h5ad`
 - `--h5ad-layer` to use an AnnData layer instead of `adata.X`

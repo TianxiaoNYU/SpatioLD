@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import os
+import warnings
 from collections.abc import Sequence
 
 import numpy as np
@@ -11,9 +12,19 @@ import pandas as pd
 
 from .diversity import (
     SpatialKernel,
+    _SharedNeighborGraph,
+    _as_2d_coords,
+    _as_radii,
+    _can_use_edge_backend,
+    _compute_local_diversity_from_shared_graph_batch,
+    _compute_local_diversity_from_shared_graph,
     _compute_local_diversity_from_label_codes,
+    _precompute_shared_neighbor_graph,
     _precompute_neighbor_graphs,
     _factorize_labels,
+    _resolve_aggregation_backend,
+    _resolve_kernel,
+    _resolve_kernel_support,
 )
 
 _NEIGHBORS_G: list[object] | None = None
@@ -21,6 +32,10 @@ _WEIGHTS_G: list[list[np.ndarray]] | None = None
 _LABEL_CODES_G: np.ndarray | None = None
 _N_LABELS_G: int | None = None
 _BASE_G: float = 2.0
+_SHARED_GRAPH_G: _SharedNeighborGraph | None = None
+_RADII_G: list[float] | None = None
+_KERNEL_NAME_G: str | None = None
+_KERNEL_SUPPORT_G: float | None = None
 _PVAL_POOLING_ALIASES: dict[str, str] = {
     "cell": "cell",
     "self": "cell",
@@ -33,6 +48,7 @@ _PVAL_POOLING_ALIASES: dict[str, str] = {
     "matched": "neighborhood_size",
 }
 _ZSCORE_EPSILON_DEFAULT: float = 1e-8
+DEFAULT_PERM_BLOCK_SIZE: int = 32
 
 
 def _init_perm_worker(
@@ -63,6 +79,51 @@ def _perm_worker(seed: int) -> np.ndarray:
         weights_by_radius=_WEIGHTS_G,
         base=_BASE_G,
     )
+
+
+def _init_edge_perm_worker(
+    shared_graph: _SharedNeighborGraph,
+    radii_list: list[float],
+    kernel_name: str,
+    kernel_support: float,
+    label_codes: np.ndarray,
+    n_labels: int,
+    base: float,
+) -> None:
+    global _SHARED_GRAPH_G, _RADII_G, _KERNEL_NAME_G, _KERNEL_SUPPORT_G
+    global _LABEL_CODES_G, _N_LABELS_G, _BASE_G
+    _SHARED_GRAPH_G = shared_graph
+    _RADII_G = radii_list
+    _KERNEL_NAME_G = kernel_name
+    _KERNEL_SUPPORT_G = kernel_support
+    _LABEL_CODES_G = label_codes
+    _N_LABELS_G = n_labels
+    _BASE_G = base
+
+
+def _edge_perm_worker(seed: int) -> np.ndarray:
+    if (
+        _SHARED_GRAPH_G is None
+        or _RADII_G is None
+        or _KERNEL_NAME_G is None
+        or _KERNEL_SUPPORT_G is None
+        or _LABEL_CODES_G is None
+        or _N_LABELS_G is None
+    ):
+        raise RuntimeError("Edge-list permutation worker was not initialized.")
+
+    rng = np.random.default_rng(seed)
+    shuffled = rng.permutation(_LABEL_CODES_G)
+    matrix, _ = _compute_local_diversity_from_shared_graph(
+        shuffled,
+        _N_LABELS_G,
+        _SHARED_GRAPH_G,
+        _RADII_G,
+        kernel_name=_KERNEL_NAME_G,
+        kernel_support=_KERNEL_SUPPORT_G,
+        base=_BASE_G,
+    )
+    return matrix
 
 
 def _run_permutations(
@@ -100,6 +161,65 @@ def _run_permutations(
     ) as pool:
         for perm_matrix in pool.imap(_perm_worker, seeds.tolist(), chunksize=chunksize):
             yield perm_matrix
+
+
+def _run_permutations_edge_backend(
+    label_codes: np.ndarray,
+    n_labels: int,
+    shared_graph: _SharedNeighborGraph,
+    radii_list: list[float],
+    *,
+    kernel_name: str,
+    kernel_support: float,
+    n_perm: int,
+    random_state: int,
+    n_jobs: int,
+    base: float,
+    perm_block_size: int,
+):
+    rng = np.random.default_rng(random_state)
+    seeds = rng.integers(0, np.iinfo(np.uint32).max, size=n_perm, dtype=np.uint32)
+
+    if n_jobs == 1:
+        block_size = _resolve_perm_block_size(perm_block_size)
+        n_cells = int(label_codes.shape[0])
+        for block_start in range(0, n_perm, block_size):
+            block_seeds = seeds[block_start:block_start + block_size]
+            label_codes_block = np.empty((block_seeds.size, n_cells), dtype=np.int64)
+            for offset, seed in enumerate(block_seeds):
+                label_codes_block[offset] = np.random.default_rng(int(seed)).permutation(label_codes)
+
+            perm_block = _compute_local_diversity_from_shared_graph_batch(
+                label_codes_block,
+                n_labels,
+                shared_graph,
+                radii_list,
+                kernel_name=kernel_name,
+                kernel_support=kernel_support,
+                base=base,
+            )
+            for offset in range(perm_block.shape[0]):
+                yield perm_block[offset]
+        return
+
+    ctx = mp.get_context("fork" if os.name != "nt" else "spawn")
+    chunksize = max(1, n_perm // (n_jobs * 4))
+    with ctx.Pool(
+        processes=n_jobs,
+        initializer=_init_edge_perm_worker,
+        initargs=(shared_graph, radii_list, kernel_name, kernel_support, label_codes, n_labels, base),
+    ) as pool:
+        for perm_matrix in pool.imap(_edge_perm_worker, seeds.tolist(), chunksize=chunksize):
+            yield perm_matrix
+
+
+def _resolve_perm_block_size(perm_block_size: int | None) -> int:
+    if perm_block_size is None:
+        return DEFAULT_PERM_BLOCK_SIZE
+    block_size = int(perm_block_size)
+    if block_size < 1:
+        raise ValueError("`perm_block_size` must be >= 1.")
+    return block_size
 
 
 def _resolve_jobs(n_jobs: int | None) -> int:
@@ -148,6 +268,24 @@ def _build_neighbor_count_groups(
             for count in np.unique(counts)
         }
         groups_by_radius.append(groups)
+    return groups_by_radius
+
+
+def _build_neighbor_count_groups_from_counts(
+    neighbor_counts: np.ndarray,
+) -> list[dict[int, np.ndarray]]:
+    counts_arr = np.asarray(neighbor_counts, dtype=np.int64)
+    if counts_arr.ndim != 2:
+        raise ValueError("`neighbor_counts` must have shape (n_radii, n_cells).")
+
+    groups_by_radius: list[dict[int, np.ndarray]] = []
+    for counts in counts_arr:
+        groups_by_radius.append(
+            {
+                int(count): np.flatnonzero(counts == count)
+                for count in np.unique(counts)
+            }
+        )
     return groups_by_radius
 
 
@@ -301,11 +439,13 @@ def _compute_nd_permutation_outputs(
     *,
     radii: Sequence[float] | None = None,
     random_state: int = 42,
-    n_jobs: int | None = None,
+    n_jobs: int | None = 1,
+    perm_block_size: int = DEFAULT_PERM_BLOCK_SIZE,
     include_self: bool = True,
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
     pval_pooling: str = "neighborhood_size",
     need_pvals: bool,
     need_mean: bool,
@@ -328,14 +468,10 @@ def _compute_nd_permutation_outputs(
         raise ValueError("`n_perm` must be >= 1.")
 
     n_jobs_eff = _resolve_jobs(n_jobs)
-    coords_arr, radii_list, neighbors_by_radius = _precompute_neighbor_graphs(
-        xy,
-        radii=radii,
-        include_self=include_self,
-        kernel=kernel,
-        kernel_support=kernel_support,
-    )
-    weights_by_radius = None
+    perm_block_size_eff = _resolve_perm_block_size(perm_block_size)
+    _resolve_aggregation_backend(aggregation_backend)
+    coords_arr = _as_2d_coords(xy)
+    radii_list = _as_radii(radii)
     labels_arr = np.asarray(labels)
     if labels_arr.shape[0] != coords_arr.shape[0]:
         raise ValueError("`xy` and `labels` must have the same number of rows.")
@@ -344,20 +480,77 @@ def _compute_nd_permutation_outputs(
     n_radii = len(radii_list)
     n_cells = coords_arr.shape[0]
     cell_ids = _resolve_cell_ids(xy, labels, n_cells=n_cells)
-    groups_by_radius = _build_neighbor_count_groups(neighbors_by_radius)
+    kernel_name, _ = _resolve_kernel(kernel)
+    resolved_support = _resolve_kernel_support(kernel_name, kernel_support)
+    use_edge_backend = _can_use_edge_backend(
+        aggregation_backend=aggregation_backend,
+        kernel_name=kernel_name,
+        resolved_support=resolved_support,
+        n_cells=n_cells,
+        n_labels=n_labels,
+    )
+
+    weights_by_radius = None
+    neighbors_by_radius = None
+    shared_graph = None
+    shared_kernel_name = None
+    shared_support = None
+    observed_for_counts = None
+    if use_edge_backend:
+        if n_jobs_eff > 1:
+            warnings.warn(
+                "The edge-list LD backend is geometry-free for permutations and usually "
+                "works best with n_jobs=1 plus blocked permutations. n_jobs > 1 can "
+                "duplicate memory across workers; consider using n_jobs=1.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        _, radii_list, shared_graph, shared_kernel_name, shared_support = _precompute_shared_neighbor_graph(
+            coords_arr,
+            radii=radii_list,
+            include_self=include_self,
+            kernel=kernel,
+            kernel_support=kernel_support,
+        )
+        observed_for_counts, neighbor_counts = _compute_local_diversity_from_shared_graph(
+            label_codes,
+            n_labels,
+            shared_graph,
+            radii_list,
+            kernel_name=shared_kernel_name,
+            kernel_support=shared_support,
+            base=base,
+        )
+        groups_by_radius = _build_neighbor_count_groups_from_counts(neighbor_counts)
+    else:
+        _, radii_list, neighbors_by_radius = _precompute_neighbor_graphs(
+            coords_arr,
+            radii=radii_list,
+            include_self=include_self,
+            kernel=kernel,
+            kernel_support=kernel_support,
+        )
+        groups_by_radius = _build_neighbor_count_groups(neighbors_by_radius)
 
     observed = None
     greater_counts = None
     less_counts = None
     pval_denominator = None
     if need_pvals or need_observed:
-        observed = _compute_local_diversity_from_label_codes(
-            label_codes,
-            n_labels,
-            neighbors_by_radius,
-            weights_by_radius=weights_by_radius,
-            base=base,
-        )
+        if use_edge_backend:
+            if observed_for_counts is None:
+                raise RuntimeError("Missing observed local-diversity matrix from edge-list backend.")
+            observed = observed_for_counts
+        else:
+            if neighbors_by_radius is None:
+                raise RuntimeError("Missing precomputed neighborhood graphs.")
+            observed = _compute_local_diversity_from_label_codes(
+                label_codes,
+                n_labels,
+                neighbors_by_radius,
+                weights_by_radius=weights_by_radius,
+                base=base,
+            )
         if need_pvals:
             pval_pooling_mode = _resolve_pval_pooling(pval_pooling)
             greater_counts = np.zeros_like(observed, dtype=np.int64)
@@ -386,8 +579,26 @@ def _compute_nd_permutation_outputs(
     perm_dist = np.empty((n_perm, n_radii, n_cells), dtype=float) if need_distribution else None
     perm_means = np.empty((n_perm, n_radii), dtype=float) if need_permutation_means else None
 
-    for perm_idx, perm_matrix in enumerate(
-        _run_permutations(
+    if use_edge_backend:
+        if shared_graph is None or shared_kernel_name is None or shared_support is None:
+            raise RuntimeError("Missing shared edge-list graph for permutation backend.")
+        perm_iter = _run_permutations_edge_backend(
+            label_codes,
+            n_labels,
+            shared_graph,
+            radii_list,
+            kernel_name=shared_kernel_name,
+            kernel_support=shared_support,
+            n_perm=n_perm,
+            random_state=random_state,
+            n_jobs=n_jobs_eff,
+            base=base,
+            perm_block_size=perm_block_size_eff,
+        )
+    else:
+        if neighbors_by_radius is None:
+            raise RuntimeError("Missing precomputed neighborhood graphs.")
+        perm_iter = _run_permutations(
             label_codes,
             n_labels,
             neighbors_by_radius,
@@ -397,7 +608,8 @@ def _compute_nd_permutation_outputs(
             n_jobs=n_jobs_eff,
             base=base,
         )
-    ):
+
+    for perm_idx, perm_matrix in enumerate(perm_iter):
         if perm_dist is not None:
             perm_dist[perm_idx] = perm_matrix
         if perm_means is not None:
@@ -504,11 +716,13 @@ def compute_nd_permutation_stats(
     *,
     radii: Sequence[float] | None = None,
     random_state: int = 42,
-    n_jobs: int | None = None,
+    n_jobs: int | None = 1,
+    perm_block_size: int = DEFAULT_PERM_BLOCK_SIZE,
     include_self: bool = True,
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
     pval_pooling: str = "neighborhood_size",
     return_distribution: bool = True,
     return_permutation_means: bool = False,
@@ -524,6 +738,14 @@ def compute_nd_permutation_stats(
         ``"global"`` pools across all permuted cells at a radius, and
         ``"neighborhood_size"`` pools across permuted cells with the same
         neighborhood size at that radius. This is the default.
+    aggregation_backend
+        ``"auto"`` uses the direct edge-list aggregation backend when it is
+        available and exact; ``"csr"`` forces the legacy sparse-matrix path;
+        ``"edge"`` requires the edge-list backend.
+    perm_block_size
+        Number of global label permutations to evaluate per compiled edge-list
+        pass when the edge backend runs with ``n_jobs=1``. Ignored by the legacy
+        CSR backend and by multi-worker edge runs.
 
     Returns
     -------
@@ -559,10 +781,12 @@ def compute_nd_permutation_stats(
         radii=radii,
         random_state=random_state,
         n_jobs=n_jobs,
+        perm_block_size=perm_block_size,
         include_self=include_self,
         base=base,
         kernel=kernel,
         kernel_support=kernel_support,
+        aggregation_backend=aggregation_backend,
         pval_pooling=pval_pooling,
         need_pvals=True,
         need_mean=True,
@@ -610,11 +834,13 @@ def compute_nd_permutation_mean(
     *,
     radii: Sequence[float] | None = None,
     random_state: int = 42,
-    n_jobs: int | None = None,
+    n_jobs: int | None = 1,
+    perm_block_size: int = DEFAULT_PERM_BLOCK_SIZE,
     include_self: bool = True,
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
 ) -> pd.DataFrame:
     """Compute matched permutation null mean for neighborhood diversity.
 
@@ -627,10 +853,12 @@ def compute_nd_permutation_mean(
         radii=radii,
         random_state=random_state,
         n_jobs=n_jobs,
+        perm_block_size=perm_block_size,
         include_self=include_self,
         base=base,
         kernel=kernel,
         kernel_support=kernel_support,
+        aggregation_backend=aggregation_backend,
         need_pvals=False,
         need_mean=True,
         need_std=False,
@@ -650,11 +878,13 @@ def compute_nd_permutation_std(
     *,
     radii: Sequence[float] | None = None,
     random_state: int = 42,
-    n_jobs: int | None = None,
+    n_jobs: int | None = 1,
+    perm_block_size: int = DEFAULT_PERM_BLOCK_SIZE,
     include_self: bool = True,
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
 ) -> pd.DataFrame:
     """Compute matched permutation null standard deviation for neighborhood diversity."""
     _, _, _, _, perm_std_df, _, _, _, _ = _compute_nd_permutation_outputs(
@@ -664,10 +894,12 @@ def compute_nd_permutation_std(
         radii=radii,
         random_state=random_state,
         n_jobs=n_jobs,
+        perm_block_size=perm_block_size,
         include_self=include_self,
         base=base,
         kernel=kernel,
         kernel_support=kernel_support,
+        aggregation_backend=aggregation_backend,
         need_pvals=False,
         need_mean=False,
         need_std=True,
@@ -687,11 +919,13 @@ def compute_nd_permutation_distribution(
     *,
     radii: Sequence[float] | None = None,
     random_state: int = 42,
-    n_jobs: int | None = None,
+    n_jobs: int | None = 1,
+    perm_block_size: int = DEFAULT_PERM_BLOCK_SIZE,
     include_self: bool = True,
     base: float = 2.0,
     kernel: SpatialKernel = "indicator",
     kernel_support: float | None = None,
+    aggregation_backend: str = "auto",
 ) -> np.ndarray:
     """Return full permutation diversity distribution.
 
@@ -707,10 +941,12 @@ def compute_nd_permutation_distribution(
         radii=radii,
         random_state=random_state,
         n_jobs=n_jobs,
+        perm_block_size=perm_block_size,
         include_self=include_self,
         base=base,
         kernel=kernel,
         kernel_support=kernel_support,
+        aggregation_backend=aggregation_backend,
         need_pvals=False,
         need_mean=False,
         need_std=False,

@@ -178,6 +178,7 @@ class SpatioLD:
         base: float = 2.0,
         kernel: SpatialKernel = "indicator",
         kernel_support: float | None = None,
+        aggregation_backend: str = "auto",
         store: bool = True,
         key: str = "spatiold_local_diversity",
     ) -> pd.DataFrame:
@@ -190,6 +191,7 @@ class SpatioLD:
             base=base,
             kernel=kernel,
             kernel_support=kernel_support,
+            aggregation_backend=aggregation_backend,
         )
         if store:
             store_matrix_in_anndata(self.adata, ld_df, key=key)
@@ -210,11 +212,13 @@ class SpatioLD:
         *,
         radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
         random_state: int = 42,
-        n_jobs: int | None = None,
+        n_jobs: int | None = 1,
+        perm_block_size: int = 32,
         include_self: bool = True,
         base: float = 2.0,
         kernel: SpatialKernel = "indicator",
         kernel_support: float | None = None,
+        aggregation_backend: str = "auto",
         pval_pooling: str = "neighborhood_size",
         return_distribution: bool = True,
         return_permutation_means: bool = False,
@@ -236,10 +240,12 @@ class SpatioLD:
             radii=radii,
             random_state=random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             base=base,
             kernel=kernel,
             kernel_support=kernel_support,
+            aggregation_backend=aggregation_backend,
             pval_pooling=pval_pooling,
             return_distribution=return_distribution,
             return_permutation_means=return_permutation_means,
@@ -265,11 +271,13 @@ class SpatioLD:
         *,
         radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
         random_state: int = 42,
-        n_jobs: int | None = None,
+        n_jobs: int | None = 1,
+        perm_block_size: int = 32,
         include_self: bool = True,
         base: float = 2.0,
         kernel: SpatialKernel = "indicator",
         kernel_support: float | None = None,
+        aggregation_backend: str = "auto",
         store: bool = True,
         key: str = "spatiold_local_diversity_perm_mean",
     ) -> pd.DataFrame:
@@ -281,10 +289,12 @@ class SpatioLD:
             radii=radii,
             random_state=random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             base=base,
             kernel=kernel,
             kernel_support=kernel_support,
+            aggregation_backend=aggregation_backend,
         )
         if store:
             store_matrix_in_anndata(self.adata, perm_mean_df, key=key)
@@ -296,11 +306,13 @@ class SpatioLD:
         *,
         radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
         random_state: int = 42,
-        n_jobs: int | None = None,
+        n_jobs: int | None = 1,
+        perm_block_size: int = 32,
         include_self: bool = True,
         base: float = 2.0,
         kernel: SpatialKernel = "indicator",
         kernel_support: float | None = None,
+        aggregation_backend: str = "auto",
         store: bool = True,
         key: str = "spatiold_local_diversity_perm_std",
     ) -> pd.DataFrame:
@@ -312,10 +324,12 @@ class SpatioLD:
             radii=radii,
             random_state=random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             base=base,
             kernel=kernel,
             kernel_support=kernel_support,
+            aggregation_backend=aggregation_backend,
         )
         if store:
             store_matrix_in_anndata(self.adata, perm_std_df, key=key)
@@ -327,11 +341,13 @@ class SpatioLD:
         *,
         radii: list[float] | tuple[float, ...] = DEFAULT_RADII,
         random_state: int = 42,
-        n_jobs: int | None = None,
+        n_jobs: int | None = 1,
+        perm_block_size: int = 32,
         include_self: bool = True,
         base: float = 2.0,
         kernel: SpatialKernel = "indicator",
         kernel_support: float | None = None,
+        aggregation_backend: str = "auto",
     ) -> np.ndarray:
         """Compute full permutation distribution (n_perm, n_radii, n_cells)."""
         return compute_nd_permutation_distribution(
@@ -341,10 +357,12 @@ class SpatioLD:
             radii=radii,
             random_state=random_state,
             n_jobs=n_jobs,
+            perm_block_size=perm_block_size,
             include_self=include_self,
             base=base,
             kernel=kernel,
             kernel_support=kernel_support,
+            aggregation_backend=aggregation_backend,
         )
 
     def summarize_local_diversity_by_cell_type(
